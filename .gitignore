@@ -1,0 +1,28 @@
+# ---- Go 构建产物 ----
+*.exe
+*.exe~
+*.test
+*.out
+*.dll
+*.so
+*.dylib
+vendor/
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.iml
+
+# ---- 本地缓存 ----
+.gocache/
+.gotmp/
+
+# ---- 系统文件 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 密钥/环境变量 ----
+.env
+.env.*
+*.pem
