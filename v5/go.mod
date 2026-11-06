@@ -1,3 +1,3 @@
-module main.go
+module workerpool
 
 go 1.26.5

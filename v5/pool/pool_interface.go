@@ -8,7 +8,12 @@ import (
 	"time"
 )
 
-var ErrPoolClosed = errors.New("pool: closed")
+var (
+	ErrPoolClosed      = errors.New("pool: closed")
+	ErrPoolTimeout     = errors.New("pool: timeout")
+	ErrTaskBufferFull  = errors.New("pool: task buffer full")
+	ErrTaskBufferEmpty = errors.New("pool: task buffer empty")
+)
 
 // BlockMode BLOCK : 0; NONBLOCK : 1
 type BlockMode int
@@ -30,23 +35,32 @@ type worker struct {
 	tasks chan task
 }
 
+// chunk taskQueue is ring queue, next points to the next chunk
 type chunk struct {
 	next      *chunk
-	taskQueue []*task
+	taskQueue []task
 	head      int
 	tail      int
 	count     int
+	mu        sync.Mutex
+}
+type chunkList struct {
+	listHead    *chunk //我们约定head为生产端，tail为消费端
+	listTail    *chunk
+	bufferCount int //记录当前缓冲区负载任务数量
+	muList      sync.Mutex
+	isFreeTask  sync.Cond
 }
 type Pool struct {
-	cfg                 Config
-	mu                  sync.Mutex     // 保护 idle 和 running 两样共享状态
-	idle                []*worker      // 空闲 worker 集合（slice 当栈用）
-	running             int            // 当前存活 worker 数（锁内维护，Running() 读它）
-	closed              chan struct{}  // Close 时 close 一次，广播给 Submit 和所有 worker
-	wg                  sync.WaitGroup // Wait() 等所有 worker 退出（V2 你用过的老搭档）
-	onceClose           sync.Once
-	isFreeWorker        chan struct{}
-	taskBufferChunkList *chunk
+	cfg          Config
+	mu           sync.Mutex     // 保护 idle 和 running 两样共享状态
+	idle         []*worker      // 空闲 worker 集合（slice 当栈用）
+	running      int            // 当前存活 worker 数（锁内维护，Running() 读它）
+	closed       chan struct{}  // Close 时 close 一次，广播给 Submit 和所有 worker
+	wg           sync.WaitGroup // Wait() 等所有 worker 退出（V2 你用过的老搭档）
+	onceClose    sync.Once
+	isFreeWorker chan struct{}
+	taskBuffer   chunkList
 }
 
 type Config struct {
@@ -58,49 +72,110 @@ type Config struct {
 	// 缓冲满了提交会直接返回错误
 }
 
-func New(cfg Config) *Pool {
+func New(cfg Config) (*Pool, error) {
 	p := new(Pool)
 	p.cfg = cfg
 	p.idle = make([]*worker, 0)
 	p.running = 0
 	p.closed = make(chan struct{})
 	p.isFreeWorker = make(chan struct{}, cfg.Capacity)
-	return p
+	if cfg.Mode == NONBLOCK {
+		return p, nil
+	}
+	//初始化task提交缓冲区
+	err := p.makeChunk()
+	if err == nil {
+		return p, errors.New("makeBuffer fail")
+	}
+	p.taskBuffer.listTail = p.taskBuffer.listHead
+	p.taskBuffer.isFreeTask.L = &p.mu
+	go p.dispatcher()
+	return p, nil
 }
+
+// makeChunk new a chunk and link it to the front of
+// taskBufferChunkListTail
 func (p *Pool) makeChunk() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.taskBufferChunkList = new(chunk)
-	p.taskBufferChunkList.taskQueue = make([]*task, p.cfg.MaxChunkLen)
-	p.taskBufferChunkList.head = 0
-	p.taskBufferChunkList.tail = 0
-	p.taskBufferChunkList.count = 0
+	p.taskBuffer.muList.Lock()
+	defer p.taskBuffer.muList.Unlock()
+	if p.taskBuffer.bufferCount >= p.cfg.MaxChunkLen {
+		return ErrTaskBufferFull
+	}
+	tmpChunk := new(chunk)
+	if p.taskBuffer.listHead == nil {
+		return errors.New("pool: make chunk fail")
+	}
+	tmpChunk.taskQueue = make([]task, p.cfg.MaxChunkLen)
+	tmpChunk.head = 0
+	tmpChunk.tail = 0
+	tmpChunk.count = 0
+	p.taskBuffer.listHead.next = tmpChunk
+	p.taskBuffer.listHead = tmpChunk
+	p.taskBuffer.listHead.next = nil
 	return nil
 }
 
-func (p *Pool) putTaskIntoBuffer(t *task) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.taskBufferChunkList.count == p.cfg.MaxChunkLen {
+func (p *Pool) putTaskIntoBuffer(t task) error {
+	select {
+	case <-p.closed:
+		return ErrPoolClosed
+	default:
+	}
+	p.taskBuffer.listHead.mu.Lock()
+	if p.taskBuffer.listHead.count == p.cfg.MaxChunkLen {
+		//这里不锁muList是因为producer只能在head chunk内写，而已经对这个chunk
+		//进行了持锁，这保证了每此只有一个producer在head chunk。所以不会导致
+		//多余的chunk被make
+		p.taskBuffer.muList.Lock()
+		if p.taskBuffer.bufferCount >= p.cfg.MaxBuffered {
+			p.taskBuffer.muList.Unlock()
+			return ErrTaskBufferFull
+		}
 		err := p.makeChunk()
 		if err != nil {
+			p.taskBuffer.listHead.mu.Unlock()
 			return err
 		}
 	}
-	head := p.taskBufferChunkList.head % p.cfg.MaxChunkLen
-	p.taskBufferChunkList.head++
-	p.taskBufferChunkList.taskQueue[head] = t
-	p.taskBufferChunkList.count++
+	head := p.taskBuffer.listHead.head % p.cfg.MaxChunkLen
+	p.taskBuffer.listHead.head++
+	p.taskBuffer.listHead.taskQueue[head] = t
+	p.taskBuffer.listHead.count++
+	p.taskBuffer.listHead.mu.Unlock()
+
+	p.taskBuffer.muList.Lock()
+	p.taskBuffer.bufferCount++
+	p.taskBuffer.muList.Unlock()
+
+	p.taskBuffer.isFreeTask.Broadcast()
 	return nil
 }
 
-func (p *Pool) drawTaskFromBuffer() *task {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	tail := p.taskBufferChunkList.tail % p.cfg.MaxChunkLen
-	p.taskBufferChunkList.tail++
-	t := p.taskBufferChunkList.taskQueue[tail]
-	return t
+// drawTaskFromBuffer submit() use drawTaskFromBuffer to gain task from buffer
+func (p *Pool) drawTaskFromBuffer() (task, error) {
+	p.taskBuffer.listTail.mu.Lock()
+	p.taskBuffer.muList.Lock()
+	if p.taskBuffer.listTail.count == 0 {
+		if p.taskBuffer.listTail.next == nil {
+			p.taskBuffer.muList.Unlock()
+			p.taskBuffer.listTail.mu.Lock()
+			//停止生产或读出速度大于写入速度导致追尾
+			return task{}, ErrTaskBufferEmpty
+		}
+		p.taskBuffer.listTail = p.taskBuffer.listTail.next
+	}
+	p.taskBuffer.muList.Unlock()
+
+	tail := p.taskBuffer.listHead.tail % p.cfg.MaxChunkLen
+	p.taskBuffer.listTail.count--
+	t := p.taskBuffer.listTail.taskQueue[tail]
+	p.taskBuffer.listTail.tail++
+	p.taskBuffer.listTail.mu.Unlock()
+
+	p.taskBuffer.muList.Lock()
+	p.taskBuffer.bufferCount--
+	p.taskBuffer.muList.Unlock()
+	return t, nil
 }
 
 // makeWorker will make a new worker goroutine with a task spread in.
@@ -147,11 +222,27 @@ func (p *Pool) makeWorker(firstTask task) {
 	}(wk, p)
 }
 
-// submit
-// return nil only means that the task have been accepted by worker,if worker
-// is popped and task is cancel by ctx.Done or deadline, task would still be
-// accepted and submit would method return nil.
-func (p *Pool) submit(t task) error {
+func (p *Pool) dispatcher() {
+	for {
+		select {
+		case <-p.closed:
+			return
+		default:
+		}
+		t, err := p.drawTaskFromBuffer()
+		if err != nil {
+			if errors.Is(err, ErrTaskBufferEmpty) {
+				p.taskBuffer.isFreeTask.Wait()
+				continue
+			}
+			log.Println(err)
+			continue
+		}
+		p.submit(t)
+	}
+}
+
+func (p *Pool) submit(t task) {
 	if t.ctx == nil {
 		t.ctx = context.Background()
 	}
@@ -181,41 +272,41 @@ func (p *Pool) submit(t task) error {
 	for {
 		select {
 		case <-p.closed:
-			return ErrPoolClosed
+			return
 		case <-t.ctx.Done():
 			giveBack()
-			return t.ctx.Err()
+			return
 		case <-deadlineC:
 			giveBack()
-			return context.DeadlineExceeded
+			return
 		default:
 		}
 		if !t.deadline.IsZero() && !time.Now().Before(t.deadline) {
 			giveBack()
-			return context.DeadlineExceeded
+			return
 		}
 		p.mu.Lock()
 		if len(p.idle) > 0 {
 			if err := abortErr(t); err != nil { // 只读检查，没改状态
 				p.mu.Unlock()
 				giveBack()
-				return err
+				return
 			}
 			wk := p.idle[0]
 			p.idle = p.idle[1:]
 			p.mu.Unlock()
 			wk.tasks <- t // 一旦 pop，就一定要发
-			return nil
+			return
 		}
 		if p.running < p.cfg.Capacity {
 			if err := abortErr(t); err != nil {
 				p.mu.Unlock()
 				giveBack()
-				return err
+				return
 			}
 			p.makeWorker(t)
 			p.mu.Unlock()
-			return nil
+			return
 		}
 		p.mu.Unlock()
 		woke = false
@@ -224,25 +315,35 @@ func (p *Pool) submit(t task) error {
 			woke = true
 			continue
 		case <-p.closed:
-			return ErrPoolClosed
+			return
 		case <-t.ctx.Done():
-			return t.ctx.Err()
+			return
 		case <-deadlineC:
-			return context.DeadlineExceeded
+			return
 		}
 	}
 }
 
+// 所有Submit类方法只保证提交的任务已入队
+
 // Submit task without context and deadline
 func (p *Pool) Submit(fn TaskFunc) error {
 	t := task{Fn: fn, ctx: context.Background()}
-	return p.submit(t)
+	if p.cfg.Mode == NONBLOCK {
+		p.submit(t)
+		return nil
+	}
+	return p.putTaskIntoBuffer(t)
 }
 
 // SubmitCtx submit task with context, able to cut off the task with this context
 func (p *Pool) SubmitCtx(ctx context.Context, fn TaskFunc) error {
 	t := task{Fn: fn, ctx: ctx}
-	return p.submit(t)
+	if p.cfg.Mode == NONBLOCK {
+		p.submit(t)
+		return nil
+	}
+	return p.putTaskIntoBuffer(t)
 }
 
 // SubmitBefore submit a TaskFunc with deadline,if deadline exceeded would not be carried out
@@ -254,9 +355,14 @@ func (p *Pool) SubmitBefore(fn TaskFunc, timeout time.Duration) error {
 	如果 SubmitBefore 把 deadline ctx 填进 Task.ctx，
 	一个在 deadline 前 1ms 开始、要跑 10s 的任务
 	会在 deadline 被 cancel——语义就从“开始期限”变成了“执行超时”*/
-	return p.submit(task{Fn: fn,
+	t := task{Fn: fn,
 		ctx:      context.Background(),
-		deadline: time.Now().Add(timeout)})
+		deadline: time.Now().Add(timeout)}
+	if p.cfg.Mode == NONBLOCK {
+		p.submit(t)
+		return nil
+	}
+	return p.putTaskIntoBuffer(t)
 }
 
 func (p *Pool) Close() {
