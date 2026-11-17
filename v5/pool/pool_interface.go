@@ -9,13 +9,15 @@ import (
 )
 
 var (
-	ErrPoolClosed      = errors.New("pool: closed")
-	ErrPoolTimeout     = errors.New("pool: timeout")
-	ErrTaskBufferFull  = errors.New("pool: task buffer full")
-	ErrTaskBufferEmpty = errors.New("pool: task buffer empty")
+	ErrPoolClosed = errors.New("pool: closed")
+	ErrPoolFull   = errors.New("pool: task buffer full")
+
+	// ErrTaskBufferFull 是历史命名，保留为 ErrPoolFull 的别名，
+	// 这样 errors.Is(err, ErrPoolFull) 和旧代码都能工作。
+	ErrTaskBufferFull = ErrPoolFull
 )
 
-// BlockMode BLOCK : 0; NONBLOCK : 1
+// BlockMode 控制缓冲队列满时提交方的行为。
 type BlockMode int
 
 const (
@@ -35,151 +37,139 @@ type worker struct {
 	tasks chan task
 }
 
-// chunk taskQueue is ring queue, next points to the next chunk
-type chunk struct {
-	next      *chunk
-	taskQueue []task
-	head      int
-	tail      int
-	count     int
-	mu        sync.Mutex
-}
-type chunkList struct {
-	listHead    *chunk //我们约定head为生产端，tail为消费端
-	listTail    *chunk
-	bufferCount int //记录当前缓冲区负载任务数量
-	muList      sync.Mutex
-	isFreeTask  sync.Cond
-}
 type Pool struct {
-	cfg          Config
-	mu           sync.Mutex     // 保护 idle 和 running 两样共享状态
-	idle         []*worker      // 空闲 worker 集合（slice 当栈用）
-	running      int            // 当前存活 worker 数（锁内维护，Running() 读它）
-	closed       chan struct{}  // Close 时 close 一次，广播给 Submit 和所有 worker
-	wg           sync.WaitGroup // Wait() 等所有 worker 退出（V2 你用过的老搭档）
-	onceClose    sync.Once
-	isFreeWorker chan struct{}
-	taskBuffer   chunkList
+	cfg Config
+
+	mu      sync.Mutex // 保护 idle / running
+	idle    []*worker  // 空闲 worker 集合（slice 当栈用）
+	running int        // 当前存活 worker 数（锁内维护）
+
+	wg        sync.WaitGroup // Wait 等 dispatcher + 所有 worker
+	onceClose sync.Once
+
+	queue      *taskQueue
+	workerFree chan struct{} // 有 worker 空闲或容量槽释放的提示
+	drained    chan struct{} // dispatcher 排空并退出后关闭
 }
 
 type Config struct {
-	Capacity    int           // worker 数量上限
-	IdleTimeout time.Duration // 空闲多久自动退出
-	MaxChunkLen int           // 每个缓冲块的容量，例如 64
-	MaxBuffered int           // 缓冲任务总数上限（背压阈值），-1 表示不设限
-	Mode        BlockMode     //Pool 任务上传是否阻塞缓冲;若非阻塞,
-	// 缓冲满了提交会直接返回错误
+	Capacity    int           // worker 数量上限，必须 > 0
+	IdleTimeout time.Duration // 空闲多久自动退出；<=0 时使用默认值
+	MaxChunkLen int           // 每个缓冲块的容量，例如 64；<=0 时使用默认值 64
+	MaxBuffered int           // 缓冲任务总数上限；-1 不设限，0 使用默认值（一个 chunk）；不必是 MaxChunkLen 的倍数
+	Mode        BlockMode     // BLOCK / NONBLOCK
 }
 
+// New 创建并启动一个 worker pool。
+//
+// 队列和 dispatcher 在 New 里就绪；dispatcher 会一直运行到 Close
+// 把队列关闭并且排空为止。
 func New(cfg Config) (*Pool, error) {
-	p := new(Pool)
-	p.cfg = cfg
-	p.idle = make([]*worker, 0)
-	p.running = 0
-	p.closed = make(chan struct{})
-	p.isFreeWorker = make(chan struct{}, cfg.Capacity)
-	if cfg.Mode == NONBLOCK {
-		return p, nil
+	if cfg.Capacity <= 0 {
+		return nil, errors.New("pool: capacity must be > 0")
 	}
-	//初始化task提交缓冲区
-	err := p.makeChunk()
-	if err == nil {
-		return p, errors.New("makeBuffer fail")
+	if cfg.Mode != BLOCK && cfg.Mode != NONBLOCK {
+		return nil, errors.New("pool: invalid block mode")
 	}
-	p.taskBuffer.listTail = p.taskBuffer.listHead
-	p.taskBuffer.isFreeTask.L = &p.mu
+
+	// 零值配置尽量可用：
+	// - MaxChunkLen 未设置时用 64；
+	// - MaxBuffered 未设置时使用一个 chunk 的容量，而不是 0（0 会让
+	//   BLOCK 永远等不到空间）；显式不设限请用 -1。
+	if cfg.MaxChunkLen <= 0 {
+		cfg.MaxChunkLen = 64
+	}
+	if cfg.MaxBuffered == 0 {
+		cfg.MaxBuffered = cfg.MaxChunkLen
+	}
+	if cfg.MaxBuffered < -1 {
+		return nil, errors.New("pool: max buffered must be -1 or > 0")
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = time.Second
+	}
+
+	p := &Pool{
+		cfg:        cfg,
+		idle:       make([]*worker, 0),
+		queue:      newTaskQueue(cfg.MaxChunkLen, cfg.MaxBuffered),
+		workerFree: make(chan struct{}, 1),
+		drained:    make(chan struct{}),
+	}
+
+	// dispatcher 也计入 wg：Wait 必须等它把最后一个任务派发出去，
+	// 不能只等 worker。
+	p.wg.Add(1)
 	go p.dispatcher()
 	return p, nil
 }
 
-// makeChunk new a chunk and link it to the front of
-// taskBufferChunkListTail
-func (p *Pool) makeChunk() error {
-	p.taskBuffer.muList.Lock()
-	defer p.taskBuffer.muList.Unlock()
-	if p.taskBuffer.bufferCount >= p.cfg.MaxChunkLen {
-		return ErrTaskBufferFull
+// dispatcher 是队列的唯一消费者。
+//
+// 生命周期：
+//  1. 队列为空且未关闭时阻塞；
+//  2. Close 后先把队列剩余任务全部派发出去；
+//  3. 队列关闭且为空时退出，并 close(drained) 通知 worker 收尾。
+//
+// dispatcher 绝不能在 Close 后立刻返回，否则缓冲区里的任务会丢。
+func (p *Pool) dispatcher() {
+	defer p.wg.Done()
+	defer close(p.drained)
+
+	for {
+		t, ok := p.queue.pop()
+		if !ok {
+			// 只有“队列已关闭且为空”才会返回 false。
+			return
+		}
+
+		// 在占用 worker 之前丢掉已取消/已超期的任务，
+		// 避免为了一个不会执行的任务消耗一个 worker。
+		if abortErr(t) != nil {
+			continue
+		}
+		p.dispatchTask(t)
 	}
-	tmpChunk := new(chunk)
-	if p.taskBuffer.listHead == nil {
-		return errors.New("pool: make chunk fail")
-	}
-	tmpChunk.taskQueue = make([]task, p.cfg.MaxChunkLen)
-	tmpChunk.head = 0
-	tmpChunk.tail = 0
-	tmpChunk.count = 0
-	p.taskBuffer.listHead.next = tmpChunk
-	p.taskBuffer.listHead = tmpChunk
-	p.taskBuffer.listHead.next = nil
-	return nil
 }
 
-func (p *Pool) putTaskIntoBuffer(t task) error {
-	select {
-	case <-p.closed:
-		return ErrPoolClosed
-	default:
-	}
-	p.taskBuffer.listHead.mu.Lock()
-	if p.taskBuffer.listHead.count == p.cfg.MaxChunkLen {
-		//这里不锁muList是因为producer只能在head chunk内写，而已经对这个chunk
-		//进行了持锁，这保证了每此只有一个producer在head chunk。所以不会导致
-		//多余的chunk被make
-		p.taskBuffer.muList.Lock()
-		if p.taskBuffer.bufferCount >= p.cfg.MaxBuffered {
-			p.taskBuffer.muList.Unlock()
-			return ErrTaskBufferFull
+// dispatchTask 把 t 交给一个 worker。
+//
+// 这是 v5 的关键交接点，必须守住不变量：
+//   - 从 idle 取走一个 worker 后，必须向它的 tasks 发送恰好一个任务；
+//   - 新建 worker 时，任务作为 firstTask 传入，不能再额外发送一次。
+//
+// 否则 worker 会在 <-wk.tasks 上永久阻塞，Close 的最后一棒也会失效。
+func (p *Pool) dispatchTask(t task) {
+	for {
+		// 在等待 worker 期间任务可能已经取消/超期，此时直接丢弃，
+		// 不占用 worker（队列长度已在 pop 时减掉）。
+		if abortErr(t) != nil {
+			return
 		}
-		err := p.makeChunk()
-		if err != nil {
-			p.taskBuffer.listHead.mu.Unlock()
-			return err
+
+		p.mu.Lock()
+		if len(p.idle) > 0 {
+			wk := p.idle[0]
+			p.idle = p.idle[1:]
+			p.mu.Unlock()
+			wk.tasks <- t // 一旦 pop，就一定要发
+			return
 		}
+		if p.running < p.cfg.Capacity {
+			p.makeWorker(t) // 新 worker 以 firstTask 启动，不再额外 send
+			p.mu.Unlock()
+			return
+		}
+		p.mu.Unlock()
+
+		// 没有空闲 worker 且达到容量上限：等 pushBack 或 worker 退出。
+		// worker 退出时 decRunning 也会发信号，避免容量槽释放后丢失唤醒。
+		<-p.workerFree
 	}
-	head := p.taskBuffer.listHead.head % p.cfg.MaxChunkLen
-	p.taskBuffer.listHead.head++
-	p.taskBuffer.listHead.taskQueue[head] = t
-	p.taskBuffer.listHead.count++
-	p.taskBuffer.listHead.mu.Unlock()
-
-	p.taskBuffer.muList.Lock()
-	p.taskBuffer.bufferCount++
-	p.taskBuffer.muList.Unlock()
-
-	p.taskBuffer.isFreeTask.Broadcast()
-	return nil
 }
 
-// drawTaskFromBuffer submit() use drawTaskFromBuffer to gain task from buffer
-func (p *Pool) drawTaskFromBuffer() (task, error) {
-	p.taskBuffer.listTail.mu.Lock()
-	p.taskBuffer.muList.Lock()
-	if p.taskBuffer.listTail.count == 0 {
-		if p.taskBuffer.listTail.next == nil {
-			p.taskBuffer.muList.Unlock()
-			p.taskBuffer.listTail.mu.Lock()
-			//停止生产或读出速度大于写入速度导致追尾
-			return task{}, ErrTaskBufferEmpty
-		}
-		p.taskBuffer.listTail = p.taskBuffer.listTail.next
-	}
-	p.taskBuffer.muList.Unlock()
-
-	tail := p.taskBuffer.listHead.tail % p.cfg.MaxChunkLen
-	p.taskBuffer.listTail.count--
-	t := p.taskBuffer.listTail.taskQueue[tail]
-	p.taskBuffer.listTail.tail++
-	p.taskBuffer.listTail.mu.Unlock()
-
-	p.taskBuffer.muList.Lock()
-	p.taskBuffer.bufferCount--
-	p.taskBuffer.muList.Unlock()
-	return t, nil
-}
-
-// makeWorker will make a new worker goroutine with a task spread in.
-// Must be used inter Mutex
+// makeWorker 创建一个 worker，并让 firstTask 成为它的第一个任务。
+// 必须在 p.mu 持有期间调用（只由 dispatcher 调用）。
 func (p *Pool) makeWorker(firstTask task) {
 	wk := &worker{tasks: make(chan task, 1)}
 	p.running++
@@ -188,15 +178,18 @@ func (p *Pool) makeWorker(firstTask task) {
 	go func(wk *worker, p *Pool) {
 		defer p.wg.Done()
 		defer p.decRunning()
+
 		t := firstTask
 		for {
 			p.runTask(t)
 			p.pushBack(wk)
+
 			timeout := time.NewTimer(p.cfg.IdleTimeout)
 			/*
-				timeout重置不放在内循环是因为select在选择timeout后worker恰好被
-				submit弹出仍能处理然后回到内循环，此时timeout.C内信号已被读取，再
-				select一次只会选择<-wk.tasks(就算被close了也能正常处理)
+				timeout 不放进外层循环重建，是因为 select 选中 timeout 后
+				worker 可能恰好被 dispatcher 认领：此时 removeIdle 失败，
+				说明任务马上会从 tasks 发过来，必须回到 select 继续等，
+				不能直接退出。
 			*/
 		inner:
 			for {
@@ -208,11 +201,14 @@ func (p *Pool) makeWorker(firstTask task) {
 					if p.removeIdle(wk) {
 						return
 					}
-				case <-p.closed:
+					// 被 dispatcher 认领了；继续等它把任务发进来。
+				case <-p.drained:
 					timeout.Stop()
 					if p.removeIdle(wk) {
 						return
 					}
+					// 被认领的 worker 一定会在 dispatcher 退出前收到任务：
+					// dispatcher 先完成 send，最后才 close(drained)。
 					t = <-wk.tasks
 					p.runTask(t)
 					return
@@ -222,179 +218,18 @@ func (p *Pool) makeWorker(firstTask task) {
 	}(wk, p)
 }
 
-func (p *Pool) dispatcher() {
-	for {
-		select {
-		case <-p.closed:
-			return
-		default:
-		}
-		t, err := p.drawTaskFromBuffer()
-		if err != nil {
-			if errors.Is(err, ErrTaskBufferEmpty) {
-				p.taskBuffer.isFreeTask.Wait()
-				continue
-			}
-			log.Println(err)
-			continue
-		}
-		p.submit(t)
-	}
-}
-
-func (p *Pool) submit(t task) {
-	if t.ctx == nil {
-		t.ctx = context.Background()
-	}
-
-	//deadlineC用于SubmitBefore
-	var deadlineC <-chan time.Time
-	if !t.deadline.IsZero() {
-		timer := time.NewTimer(time.Until(t.deadline))
-		defer timer.Stop()
-		deadlineC = timer.C
-	}
-
-	//若等待中被isWorkerFree唤醒后该任务又被取消，则非阻塞地往isWorkerFree补一个token
-	//尽管补token容易漏返回路径，但是做成广播会导致惊群，在worker数量大时会产生O(n)负担
-	woke := false
-	giveBack := func() {
-		if !woke {
-			return
-		}
-		select {
-		case p.isFreeWorker <- struct{}{}:
-		default:
-		}
-		woke = false
-	}
-
-	for {
-		select {
-		case <-p.closed:
-			return
-		case <-t.ctx.Done():
-			giveBack()
-			return
-		case <-deadlineC:
-			giveBack()
-			return
-		default:
-		}
-		if !t.deadline.IsZero() && !time.Now().Before(t.deadline) {
-			giveBack()
-			return
-		}
-		p.mu.Lock()
-		if len(p.idle) > 0 {
-			if err := abortErr(t); err != nil { // 只读检查，没改状态
-				p.mu.Unlock()
-				giveBack()
-				return
-			}
-			wk := p.idle[0]
-			p.idle = p.idle[1:]
-			p.mu.Unlock()
-			wk.tasks <- t // 一旦 pop，就一定要发
-			return
-		}
-		if p.running < p.cfg.Capacity {
-			if err := abortErr(t); err != nil {
-				p.mu.Unlock()
-				giveBack()
-				return
-			}
-			p.makeWorker(t)
-			p.mu.Unlock()
-			return
-		}
-		p.mu.Unlock()
-		woke = false
-		select {
-		case <-p.isFreeWorker:
-			woke = true
-			continue
-		case <-p.closed:
-			return
-		case <-t.ctx.Done():
-			return
-		case <-deadlineC:
-			return
-		}
-	}
-}
-
-// 所有Submit类方法只保证提交的任务已入队
-
-// Submit task without context and deadline
-func (p *Pool) Submit(fn TaskFunc) error {
-	t := task{Fn: fn, ctx: context.Background()}
-	if p.cfg.Mode == NONBLOCK {
-		p.submit(t)
-		return nil
-	}
-	return p.putTaskIntoBuffer(t)
-}
-
-// SubmitCtx submit task with context, able to cut off the task with this context
-func (p *Pool) SubmitCtx(ctx context.Context, fn TaskFunc) error {
-	t := task{Fn: fn, ctx: ctx}
-	if p.cfg.Mode == NONBLOCK {
-		p.submit(t)
-		return nil
-	}
-	return p.putTaskIntoBuffer(t)
-}
-
-// SubmitBefore submit a TaskFunc with deadline,if deadline exceeded would not be carried out
-func (p *Pool) SubmitBefore(fn TaskFunc, timeout time.Duration) error {
-	if timeout <= 0 {
-		return context.DeadlineExceeded
-	}
-	/*不直接构造context.WithDeadline 复用 SubmitCtx，是因为的 TaskFunc 接 ctx。
-	如果 SubmitBefore 把 deadline ctx 填进 Task.ctx，
-	一个在 deadline 前 1ms 开始、要跑 10s 的任务
-	会在 deadline 被 cancel——语义就从“开始期限”变成了“执行超时”*/
-	t := task{Fn: fn,
-		ctx:      context.Background(),
-		deadline: time.Now().Add(timeout)}
-	if p.cfg.Mode == NONBLOCK {
-		p.submit(t)
-		return nil
-	}
-	return p.putTaskIntoBuffer(t)
-}
-
-func (p *Pool) Close() {
-	p.onceClose.Do(func() {
-		close(p.closed)
-	})
-}
-
-func (p *Pool) Wait() {
-	p.wg.Wait()
-}
-
-// Running return the number of worker living now
-func (p *Pool) Running() int {
+// pushBack 把执行完任务的 worker 放回 idle。
+func (p *Pool) pushBack(wk *worker) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.running
+	p.idle = append(p.idle, wk)
+	p.mu.Unlock()
+
+	// 先改状态，再发信号；否则等待者可能看到旧状态又睡回去。
+	p.signalWorkerFree()
 }
 
-// runTask recover task once it panic,and log.Printf
-func (p *Pool) runTask(t task) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("task panic: %v", r)
-		}
-	}()
-	if abortErr(t) == nil {
-		_ = t.Fn(t.ctx)
-	}
-}
-
-// clear timed out worker , should not be used inside mutex
+// removeIdle 从 idle 中移除 worker；返回 false 表示它已被 dispatcher 认领。
+// 不要持 p.mu 调用。
 func (p *Pool) removeIdle(wk *worker) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -407,33 +242,114 @@ func (p *Pool) removeIdle(wk *worker) bool {
 	return false
 }
 
-// push worker back to pool
-func (p *Pool) pushBack(wk *worker) {
-	p.mu.Lock()
-	p.idle = append(p.idle, wk)
-	p.mu.Unlock()
-	select {
-	case p.isFreeWorker <- struct{}{}:
-	default:
-	}
-}
-
-// do -1 operation to running
+// decRunning 在 worker 退出时减少计数。
+//
+// 注意：worker 因 idle timeout 退出也会释放一个 Capacity 槽。如果这里
+// 不发信号，dispatcher 可能刚好在“running == Capacity、idle 为空”时
+// 永久等待一个不会到来的 worker，所以退出也必须唤醒等待者。
 func (p *Pool) decRunning() {
 	p.mu.Lock()
 	p.running--
 	p.mu.Unlock()
+	p.signalWorkerFree()
 }
 
-// abortErr is a function to check a task's ctx.Done and deadline
-func abortErr(t task) error {
+func (p *Pool) signalWorkerFree() {
 	select {
-	case <-t.ctx.Done():
-		return t.ctx.Err()
+	case p.workerFree <- struct{}{}:
 	default:
-		if !t.deadline.IsZero() && !time.Now().Before(t.deadline) {
-			return context.DeadlineExceeded
+	}
+}
+
+// Submit 把任务放入缓冲队列。
+//
+// 返回 nil 只表示“已入队”，不表示“已执行”；任务之后仍可能因为
+// ctx 取消或 deadline 过期被 dispatcher/worker 跳过。
+func (p *Pool) Submit(fn TaskFunc) error {
+	return p.enqueue(task{Fn: fn, ctx: context.Background()})
+}
+
+// SubmitCtx 带 context 提交。等待缓冲空间期间可以被 ctx 取消。
+func (p *Pool) SubmitCtx(ctx context.Context, fn TaskFunc) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return p.enqueue(task{Fn: fn, ctx: ctx})
+}
+
+// SubmitBefore 给任务一个“开始执行”的期限，而不是执行时长限制。
+//
+// 如果在等待缓冲空间时到期，返回 DeadlineExceeded 且不入队；
+// 如果已经入队但排队到 deadline 之后，dispatcher/worker 会跳过它。
+func (p *Pool) SubmitBefore(fn TaskFunc, timeout time.Duration) error {
+	if timeout <= 0 {
+		return context.DeadlineExceeded
+	}
+	return p.enqueue(task{
+		Fn:       fn,
+		ctx:      context.Background(),
+		deadline: time.Now().Add(timeout),
+	})
+}
+
+func (p *Pool) enqueue(t task) error {
+	return p.queue.push(t, t.ctx, t.deadline, p.cfg.Mode)
+}
+
+// Close 停止接收新任务，并触发 dispatcher 排空缓冲区。
+//
+// Close 本身不阻塞；需要等所有已入队任务执行完，请调用 Wait。
+// 典型顺序：Close() -> Wait()。
+func (p *Pool) Close() {
+	p.onceClose.Do(func() {
+		p.queue.close()
+	})
+}
+
+// Wait 等 dispatcher 和所有 worker 退出。
+//
+// 必须在 Close 之后调用：不 Close 时 dispatcher 会一直等队列，
+// Wait 永远不会返回。
+func (p *Pool) Wait() {
+	p.wg.Wait()
+}
+
+// Running 返回当前存活的 worker 数（不包含 dispatcher）。
+func (p *Pool) Running() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.running
+}
+
+// runTask 是任务执行的唯一入口：panic 隔离 + ctx/deadline 检查。
+// 跳过执行不等于跳过清理；worker 的归还和退出由调用方继续负责。
+func (p *Pool) runTask(t task) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("task panic: %v", r)
 		}
+	}()
+
+	if abortErr(t) == nil {
+		ctx := t.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		_ = t.Fn(ctx)
+	}
+}
+
+// abortErr 检查任务是否已经取消或超过开始执行期限。
+func abortErr(t task) error {
+	if t.ctx != nil {
+		select {
+		case <-t.ctx.Done():
+			return t.ctx.Err()
+		default:
+		}
+	}
+	if !t.deadline.IsZero() && !time.Now().Before(t.deadline) {
+		return context.DeadlineExceeded
 	}
 	return nil
 }
