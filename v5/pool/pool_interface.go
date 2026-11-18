@@ -179,12 +179,23 @@ func (p *Pool) makeWorker(firstTask task) {
 		defer p.wg.Done()
 		defer p.decRunning()
 
+		// 每个 worker 只创建一个 timer，之后每次空闲等待前 Reset。
+		// 空任务密集时，每任务 NewTimer 会把大量时间花在 timer 堆和
+		// 分配上；复用后只保留一次创建，Reset 仍然会重新定时，但不再
+		// 产生新的 timer 对象。
+		timeout := time.NewTimer(p.cfg.IdleTimeout)
+		defer timeout.Stop()
+
 		t := firstTask
 		for {
 			p.runTask(t)
 			p.pushBack(wk)
 
-			timeout := time.NewTimer(p.cfg.IdleTimeout)
+			// 上一轮执行期间 timer 可能已经触发（尤其是慢任务），
+			// 先 Stop 并清掉可能残留的 channel 值，再 Reset 到完整的
+			// IdleTimeout，避免带着过期信号进入 select。
+			resetTimer(timeout, p.cfg.IdleTimeout)
+
 			/*
 				timeout 不放进外层循环重建，是因为 select 选中 timeout 后
 				worker 可能恰好被 dispatcher 认领：此时 removeIdle 失败，
@@ -195,7 +206,8 @@ func (p *Pool) makeWorker(firstTask task) {
 			for {
 				select {
 				case t = <-wk.tasks:
-					timeout.Stop()
+					// 不在这里 Stop：外层 resetTimer 会统一 Stop/drain/Reset。
+					// 这样任务执行期间即使 timer 到期，也不会留下旧信号。
 					break inner
 				case <-timeout.C:
 					if p.removeIdle(wk) {
@@ -216,6 +228,21 @@ func (p *Pool) makeWorker(firstTask task) {
 			}
 		}
 	}(wk, p)
+}
+
+// resetTimer 复用 time.Timer：先停止并清空可能已触发的 channel，
+// 再重新设置 IdleTimeout。
+//
+// time.Timer.Reset 要求旧 timer 已停止或已过期，且 channel 已 drain；
+// 这里统一处理，避免“任务和 timeout 同时就绪”时把旧信号带到下一轮。
+func resetTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
 }
 
 // pushBack 把执行完任务的 worker 放回 idle。
@@ -251,6 +278,7 @@ func (p *Pool) decRunning() {
 	p.mu.Lock()
 	p.running--
 	p.mu.Unlock()
+
 	p.signalWorkerFree()
 }
 
