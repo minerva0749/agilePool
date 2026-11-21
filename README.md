@@ -1,59 +1,110 @@
 # agilePool — Go 协程池练习
 
-用纯 Go 标准库从零实现一个协程池，按版本递进：固定池 → 关闭/panic 安全 → 按需创建 + 空闲回收。
+用纯 Go 标准库从零实现一个协程池。当前仓库只保留 **v5**：在 v4 的 context/超时语义之上，加入分块链表缓冲队列、背压和 BLOCK / NONBLOCK 提交模式。
 
-## 版本
+## v5 能力
 
-| 版本 | 目录 | 核心能力 | 状态 |
-|---|---|---|---|
-| v3 | [`v3/`](v3/) | 按需创建 worker、空闲超时自动回收、容量上限背压、panic 隔离 | ✅ 当前 |
-| v4 | `v4/` | 计划中 | 🚧 |
-| v5 | `v5/` | 计划中 | 📝 |
-
-## v3 设计要点
-
-- **按需创建**：池子初始为空，`Submit` 时优先复用空闲 worker，没有则新建，直到 `Capacity` 上限。
-- **空闲回收**：worker 空闲超过 `IdleTimeout` 自行退出，池子能自然缩容到 0。
-- **背压**：达到容量上限时，`Submit` 阻塞等待空闲 worker（或池关闭），而不是无限堆积。
-- **安全关闭**：`Close` 幂等；已提交任务会被执行完；`Wait` 等所有 worker 退出。
+- **分块链表 FIFO 缓冲**：固定大小的 chunk 串成链表，写满追加一块，消费完的块交给 GC 回收。
+- **背压**：`MaxBuffered` 控制缓冲任务总数上限，`MaxChunkLen` 控制每个 chunk 的容量。
+- **BLOCK**：缓冲满时阻塞提交方；等待空间期间可以被 `ctx` 或 deadline 取消。
+- **NONBLOCK**：缓冲满时立即返回 `ErrPoolFull`，把决策权交给调用方。
+- **dispatcher**：单消费者从缓冲队列取任务，再交给 worker，提交路径与执行路径解耦。
+- **按需创建 worker**：优先复用空闲 worker，没有则新建，直到 `Capacity` 上限。
+- **空闲回收**：worker 空闲超过 `IdleTimeout` 自动退出，池子可缩容到 0。
+- **取消与超时**：`SubmitCtx` / `SubmitBefore`；已取消或已过期的任务会在派发/执行前被跳过。
+- **安全关闭**：`Close` 停止接收新任务，dispatcher 排空缓冲区后退出；`WaitPool` 等 dispatcher 和所有 worker 结束。
 - **panic 隔离**：单个任务 panic 只记日志，不会带走 worker。
 
 ## 快速开始
 
 ```go
-p := pool.New(pool.Config{
-    Capacity:    1000,
-    IdleTimeout: 10 * time.Millisecond,
-})
+package main
 
-_ = p.Submit(func() {
-    // 你的任务
-})
+import (
+    "context"
+    "log"
+    "time"
 
-p.Close() // 停止接收新任务
-p.Wait()  // 等已提交任务跑完
+    "workerpool/pool"
+)
+
+func main() {
+    p, err := pool.New(pool.Config{
+        Capacity:    64,
+        IdleTimeout: 100 * time.Millisecond,
+        MaxChunkLen: 64,
+        MaxBuffered: 1024,
+        Mode:        pool.BLOCK,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if err := p.Submit(func(ctx context.Context) error {
+        // 在这里执行任务
+        return nil
+    }); err != nil {
+        log.Printf("submit: %v", err)
+    }
+
+    p.Close()    // 停止接收新任务，并触发缓冲区排空
+    p.WaitPool() // 等 dispatcher 和所有 worker 退出
+}
 ```
+
+`Submit` 返回 `nil` 只表示任务**已经入队**，不表示已经执行；任务之后仍可能因为 `ctx` 取消或 deadline 过期被跳过。
+
+### 配置零值
+
+| 字段 | 说明 | 零值/非法值 |
+|---|---|---|
+| `Capacity` | worker 数量上限 | 必须 `> 0`，否则 `New` 返回错误 |
+| `IdleTimeout` | worker 空闲多久后退出 | `<= 0` 时使用默认值 `1s` |
+| `MaxChunkLen` | 每个 chunk 的容量 | `<= 0` 时使用默认值 `64` |
+| `MaxBuffered` | 缓冲任务总数上限 | `0` 时默认一个 chunk；`-1` 不设限；`< -1` 报错 |
+| `Mode` | 缓冲满时的提交行为 | 默认 `BLOCK`；非法值 `New` 返回错误 |
+
+### 错误
+
+- `pool.ErrPoolClosed`：池已关闭，不再接受新任务。
+- `pool.ErrPoolFull`：`NONBLOCK` 模式下缓冲已满。
+- `context.Canceled` / `context.DeadlineExceeded`：提交等待期间被取消或到期。
 
 ## 运行与测试
 
 ```bash
-cd v3
-go run .        # 1000 并发提交 × 100 任务，最终输出 done: 100000
-go test ./...   # 13 个测试：生命周期、容量、复用、关闭、panic 隔离、并发压测
+cd v5
+go run .                 # 提交 1000 个任务，输出 done: 1000
+go test ./...            # 20 个测试：队列、背压、关闭排空、取消/超时、panic、压力
 go test -race ./...
+go test ./pool -run TestTaskQueue -v
+go test ./pool -bench . -benchmem -run '^$'
 ```
 
 ## 目录
 
-```
-v3/
+```text
+v5/
 ├─ go.mod
 ├─ main.go
-├─ 学习指南.md
 └─ pool/
    ├─ pool_interface.go
-   └─ pool_test.go
+   ├─ task_queue.go
+   ├─ pool_test.go
+   ├─ task_queue_test.go
+   └─ benchmark_test.go
 ```
+
+## 设计要点
+
+```text
+提交方 --Submit--> [chunk queue] <--消费-- [dispatcher] --派发--> worker
+```
+
+- 多个提交者只操作队列的生产端，dispatcher 是唯一的消费者，因此队列只用一把锁即可。
+- `BLOCK` 的等待由 `notFull` 提示、`closed` 信号、`ctx.Done()` 和 deadline 共同驱动；被唤醒后必须在锁内重新检查条件。
+- dispatcher 从队列取出任务后，先检查 `ctx`/deadline，再取 worker，避免为不会执行的任务占用 worker。
+- `Close` 不会丢弃已经入队的任务：dispatcher 会一直排空到队列关闭且为空，最后关闭 `drained`，worker 再收尾退出。
 
 ## License
 
