@@ -44,7 +44,7 @@ type Pool struct {
 	idle    []*worker  // 空闲 worker 集合（slice 当栈用）
 	running int        // 当前存活 worker 数（锁内维护）
 
-	wg        sync.WaitGroup // Wait 等 dispatcher + 所有 worker
+	wg        sync.WaitGroup // WaitPool 等 dispatcher + 所有 worker
 	onceClose sync.Once
 
 	queue      *taskQueue
@@ -326,20 +326,25 @@ func (p *Pool) enqueue(t task) error {
 
 // Close 停止接收新任务，并触发 dispatcher 排空缓冲区。
 //
-// Close 本身不阻塞；需要等所有已入队任务执行完，请调用 Wait。
-// 典型顺序：Close() -> Wait()。
+// Close 本身不阻塞；需要等所有已入队任务执行完，请调用 WaitPool。
+// 典型顺序：Close() -> WaitPool()。
 func (p *Pool) Close() {
 	p.onceClose.Do(func() {
 		p.queue.close()
 	})
 }
 
-// Wait 等 dispatcher 和所有 worker 退出。
+// WaitPool 等 dispatcher 和所有 worker 退出。
 //
 // 必须在 Close 之后调用：不 Close 时 dispatcher 会一直等队列，
-// Wait 永远不会返回。
-func (p *Pool) Wait() {
+// WaitPool 永远不会返回。
+func (p *Pool) WaitPool() {
 	p.wg.Wait()
+}
+
+// WaitIdle 等待 pendingTasks 归零
+func (p *Pool) WaitIdle() {
+
 }
 
 // Running 返回当前存活的 worker 数（不包含 dispatcher）。

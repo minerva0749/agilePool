@@ -49,7 +49,7 @@ func BenchmarkSubmitParallel(b *testing.B) {
 
 	b.StopTimer()
 	p.Close()
-	p.Wait()
+	p.WaitPool()
 }
 
 // BenchmarkTaskQueuePushParallel 只测 taskQueue 的 push/pop，不经过

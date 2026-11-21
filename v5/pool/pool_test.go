@@ -44,7 +44,7 @@ func closeAndWaitWithin(t *testing.T, p *Pool, timeout time.Duration) {
 
 	done := make(chan struct{})
 	go func() {
-		p.Wait()
+		p.WaitPool()
 		close(done)
 	}()
 	select {

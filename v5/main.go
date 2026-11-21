@@ -38,8 +38,8 @@ func main() {
 		}
 	}
 
-	wg.Wait() // 等任务真正执行完
-	p.Close() // 停止接收新任务，dispatcher 排空剩余缓冲
-	p.Wait()  // 等 dispatcher 和所有 worker 退出
+	wg.Wait()    // 等任务真正执行完
+	p.Close()    // 停止接收新任务，dispatcher 排空剩余缓冲
+	p.WaitPool() // 等 dispatcher 和所有 worker 退出
 	fmt.Println("done:", total)
 }
