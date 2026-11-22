@@ -12,8 +12,13 @@
 - **按需创建 worker**：优先复用空闲 worker，没有则新建，直到 `Capacity` 上限。
 - **空闲回收**：worker 空闲超过 `IdleTimeout` 自动退出，池子可缩容到 0。
 - **取消与超时**：`SubmitCtx` / `SubmitBefore`；已取消或已过期的任务会在派发/执行前被跳过。
+- **任务级等待**：`WaitIdle` 等待“已接受 + 正在提交”的任务全部到达终态，不需要先关闭池，返回后仍可继续提交。
 - **安全关闭**：`Close` 停止接收新任务，dispatcher 排空缓冲区后退出；`WaitPool` 等 dispatcher 和所有 worker 结束。
 - **panic 隔离**：单个任务 panic 只记日志，不会带走 worker。
+- **参数校验**：`fn == nil` 返回 `ErrNilTask`；配置默认值与校验集中在 `normalizeConfig`。
+
+完整的状态机、提交错误优先级、并发不变量和阶段验收记录见
+[v5/实现方案与接口.md](v5/实现方案与接口.md)。
 
 ## 快速开始
 
@@ -47,12 +52,15 @@ func main() {
         log.Printf("submit: %v", err)
     }
 
+    p.WaitIdle() // 等当前批次任务全部结束；池仍可继续提交
     p.Close()    // 停止接收新任务，并触发缓冲区排空
     p.WaitPool() // 等 dispatcher 和所有 worker 退出
 }
 ```
 
 `Submit` 返回 `nil` 只表示任务**已经入队**，不表示已经执行；任务之后仍可能因为 `ctx` 取消或 deadline 过期被跳过。
+
+`WaitIdle` 是批次等待，不是关闭：它等待调用时已接受的任务以及正在提交的任务归零。不要从任务函数内部调用它（任务会等待自己）。
 
 ### 配置零值
 
@@ -68,16 +76,21 @@ func main() {
 
 - `pool.ErrPoolClosed`：池已关闭，不再接受新任务。
 - `pool.ErrPoolFull`：`NONBLOCK` 模式下缓冲已满。
+- `pool.ErrNilTask`：提交的 `TaskFunc` 为 `nil`。
 - `context.Canceled` / `context.DeadlineExceeded`：提交等待期间被取消或到期。
+
+提交错误按固定优先级返回：`ErrNilTask` → `SubmitBefore` 的非正 timeout →
+`ErrPoolClosed` → `ctx.Err()` → `DeadlineExceeded` → `ErrPoolFull`。
+`Close` 之后即使任务 ctx 已取消，也稳定返回 `ErrPoolClosed`，便于 producer 判断停止。
 
 ## 运行与测试
 
 ```bash
 cd v5
 go run .                 # 提交 1000 个任务，输出 done: 1000
-go test ./...            # 20 个测试：队列、背压、关闭排空、取消/超时、panic、压力
+go test ./...            # 58 个测试：队列、背压、关闭排空、取消/超时、pending、WaitIdle、panic、压力
 go test -race ./...
-go test ./pool -run TestTaskQueue -v
+go test ./pool -run 'TestTaskQueue|TestWaitIdle' -v
 go test ./pool -bench . -benchmem -run '^$'
 ```
 
@@ -87,12 +100,19 @@ go test ./pool -bench . -benchmem -run '^$'
 v5/
 ├─ go.mod
 ├─ main.go
+├─ 实现方案与接口.md
 └─ pool/
    ├─ pool_interface.go
    ├─ task_queue.go
+   ├─ task_state.go
    ├─ pool_test.go
    ├─ task_queue_test.go
-   └─ benchmark_test.go
+   ├─ pool_api_test.go
+   ├─ pool_regression_test.go
+   ├─ task_accounting_test.go
+   ├─ waitidle_test.go
+   ├─ benchmark_test.go
+   └─ benchmark_endtoend_test.go
 ```
 
 ## 设计要点
@@ -105,6 +125,9 @@ v5/
 - `BLOCK` 的等待由 `notFull` 提示、`closed` 信号、`ctx.Done()` 和 deadline 共同驱动；被唤醒后必须在锁内重新检查条件。
 - dispatcher 从队列取出任务后，先检查 `ctx`/deadline，再取 worker，避免为不会执行的任务占用 worker。
 - `Close` 不会丢弃已经入队的任务：dispatcher 会一直排空到队列关闭且为空，最后关闭 `drained`，worker 再收尾退出。
+- 所有终态（完成/error/panic/取消跳过/超期跳过）统一经过 `finishTask`，保证每个被接受的任务恰好扣一次 pending。
+- `pendingTracker` 分开记录 `pending`（已接受）与 `submitting`（提交中）；`WaitIdle` 等两者归零，但 `pending` 仍只统计已接受任务。
+- 需要等池退出时使用 `Close → WaitIdle → WaitPool`：`WaitIdle` 等任务终态，`WaitPool` 等 goroutine 收尾。
 
 ## License
 

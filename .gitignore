@@ -22,6 +22,12 @@ vendor/
 Thumbs.db
 desktop.ini
 
+# ---- 文档 ----
+# 只跟踪 README 与 v5 的唯一设计/验收文档，其余 Markdown 不入库
+*.md
+!README.md
+!v5/实现方案与接口.md
+
 # ---- 密钥/环境变量 ----
 .env
 .env.*

@@ -50,6 +50,15 @@ type taskQueue struct {
 
 	notEmpty chan struct{} // 队列非空提示，容量 1，允许合并
 	notFull  chan struct{} // 队列有空位提示，容量 1
+
+	// onAccept 在 pushLocked 写入任务后、仍持有 q.mu 时调用。
+	// Pool 用它把“接受任务”和“pending +1”放进同一个临界区，
+	// 保证 dispatcher 不可能在计数增加之前 pop 到该任务。
+	//
+	// 只允许在回调里获取 pending 的锁；不能反向获取 q.mu，否则会
+	// 与 finishTask（pending.mu）和 pop（q.mu）形成锁环。队列单测
+	// 和纯队列基准中它为 nil。
+	onAccept func()
 }
 
 func newTaskQueue(chunkLen, max int) *taskQueue {
@@ -85,19 +94,22 @@ func (q *taskQueue) size() int {
 
 // push 入队。
 //
-// BLOCK：队列满时等待 notFull/closed/ctx/deadline；
-// NONBLOCK：队列满时立即返回 ErrPoolFull。
+// 错误优先级（T2 固定）：
+//  1. 池已关闭 → ErrPoolClosed；
+//  2. ctx 已取消 → ctx.Err()；
+//  3. 任务 deadline 已过 → context.DeadlineExceeded；
+//  4. NONBLOCK 且队列满 → ErrPoolFull。
+//
+// 关闭优先于 ctx/deadline：Close 之后所有提交都稳定返回 ErrPoolClosed，
+// 不会因为 ctx 恰好也取消而返回两种不同的错误。
+//
+// BLOCK 模式下，队列满时等待 notFull/closed/ctx/deadline；每次醒来都在
+// 锁内重新检查真实条件，因为 notFull 只是“可能有过空位”的提示。
 //
 // 入队成功只表示任务已经进入缓冲队列，不表示已经执行。
 func (q *taskQueue) push(t task, ctx context.Context, deadline time.Time, mode BlockMode) error {
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if !deadline.IsZero() && !time.Now().Before(deadline) {
-		return context.DeadlineExceeded
 	}
 
 	var deadlineC <-chan time.Time
@@ -107,27 +119,35 @@ func (q *taskQueue) push(t task, ctx context.Context, deadline time.Time, mode B
 		deadlineC = timer.C
 	}
 
-	// woke 表示上一次循环消费了 notFull token。若醒来后任务又被取消，
-	// 要把这个“空位提示”还回去，否则其他阻塞的提交者可能永远等不到唤醒。
+	// woke 表示上一次循环消费了 notFull token。若醒来后发现任务已被
+	// 取消/超期（不是关闭），要把这个“空位提示”还回去，否则其他阻塞的
+	// 提交者可能永远等不到唤醒。
 	woke := false
 	for {
-		if err := ctx.Err(); err != nil {
-			if woke {
-				q.signalNotFull()
-			}
-			return err
-		}
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			if woke {
-				q.signalNotFull()
-			}
-			return context.DeadlineExceeded
-		}
+		// 在锁外读取 ctx.Err()：自定义 Context 的 Err 方法属于用户代码，
+		// 不应在 queue.mu 持有期间调用。若 ctx 在读取后、加锁前被取消，
+		// 任务可能仍然入队，随后由 dispatcher/worker 的 abortErr 跳过；
+		// 这与入队后取消的既有语义一致。
+		ctxErr := ctx.Err()
 
 		q.mu.Lock()
 		if q.closed {
 			q.mu.Unlock()
 			return ErrPoolClosed
+		}
+		if ctxErr != nil {
+			q.mu.Unlock()
+			if woke {
+				q.signalNotFull()
+			}
+			return ctxErr
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			q.mu.Unlock()
+			if woke {
+				q.signalNotFull()
+			}
+			return context.DeadlineExceeded
 		}
 		if q.maxTaskNum < 0 || q.taskNum < q.maxTaskNum {
 			q.pushLocked(t)
@@ -152,11 +172,9 @@ func (q *taskQueue) push(t task, ctx context.Context, deadline time.Time, mode B
 		case <-q.notFull:
 			woke = true
 		case <-q.closedCh:
-			return ErrPoolClosed
+			// 回到循环顶部，由 closed 检查决定返回值。
 		case <-ctx.Done():
-			return ctx.Err()
 		case <-deadlineC:
-			return context.DeadlineExceeded
 		}
 	}
 }
@@ -179,6 +197,9 @@ func (q *taskQueue) pushLocked(t task) {
 	q.tail.tasks[idx] = t
 	q.tail.count++
 	q.taskNum++
+	if q.onAccept != nil {
+		q.onAccept()
+	}
 }
 
 // pop 取队头任务。
