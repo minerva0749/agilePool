@@ -3,6 +3,8 @@ package pool
 import (
 	"context"
 	"errors"
+	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -43,14 +45,21 @@ type task struct {
 
 type worker struct {
 	tasks chan task
+
+	// 以下字段只被 fifoIdle 使用，作为 idle 双向链表的节点；只在持有 p.mu
+	// 且 worker 位于 idle 容器时有效。stackIdle 实现不使用它们（T12）。
+	idlePrev   *worker
+	idleNext   *worker
+	idleLinked bool
 }
 
 type Pool struct {
 	cfg Config
 
-	mu      sync.Mutex // 保护 idle / running
-	idle    []*worker  // 空闲 worker 集合（slice 当栈用）
-	running int        // 当前存活 worker 数（锁内维护）
+	mu      sync.Mutex    // 保护 idle / running / created
+	idle    idleContainer // 空闲 worker 容器（默认 FIFO；T12 包内可插拔）
+	running int           // 当前存活 worker 数（锁内维护）
+	created int64         // 自 New 以来创建过的 worker 总数（锁内维护，只增不减）
 
 	wg        sync.WaitGroup // WaitPool 等 dispatcher + 所有 worker
 	onceClose sync.Once
@@ -64,6 +73,13 @@ type Pool struct {
 	// 计数点与所有权规则见 task_state.go 的 finishTask 和
 	// taskQueue.pushLocked 里的 onAccept 回调。
 	pending *pendingTracker
+
+	// 以下诊断与生命周期回调全部在 New 时固定，运行期间只读：
+	// 不需要原子操作或锁，也不会与 worker 竞争。
+	logger       Logger
+	errorHandler ErrorHandler
+	panicHandler PanicHandler
+	hooks        Hooks
 }
 
 type Config struct {
@@ -72,6 +88,18 @@ type Config struct {
 	MaxChunkLen int           // 每个缓冲块的容量，例如 64；<=0 时使用默认值 64
 	MaxBuffered int           // 缓冲任务总数上限；-1 不设限，0 使用默认值（一个 chunk）；不必是 MaxChunkLen 的倍数
 	Mode        BlockMode     // BLOCK / NONBLOCK
+
+	// 以下是可选的诊断与生命周期回调，全部在 New 时固定，运行期间不再修改。
+	// 零值表示不启用；不影响队列、worker 数量和任务语义。
+
+	// Logger 用于池的诊断输出；nil 表示 log.Default()。
+	Logger Logger
+	// ErrorHandler 接收任务返回的非 nil error；nil 表示静默丢弃。
+	ErrorHandler ErrorHandler
+	// PanicHandler 接收任务 panic；nil 表示通过 Logger 输出默认报告。
+	PanicHandler PanicHandler
+	// Hooks 是任务与池的生命周期回调；零值表示不监听。
+	Hooks Hooks
 }
 
 // New 创建并启动一个 worker pool。
@@ -90,14 +118,26 @@ func New(cfg Config) (*Pool, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newPool(cfg, newFIFOIdle()), nil
+}
 
+// newPool 用已 normalize 的配置和指定的 idle 容器构造池。
+// 仅供包内测试替换容器实现（T12）；生产入口只用 New。
+func newPool(cfg Config, idle idleContainer) *Pool {
 	p := &Pool{
-		cfg:        cfg,
-		idle:       make([]*worker, 0),
-		queue:      newTaskQueue(cfg.MaxChunkLen, cfg.MaxBuffered),
-		workerFree: make(chan struct{}, 1),
-		drained:    make(chan struct{}),
-		pending:    newPendingTracker(),
+		cfg:          cfg,
+		idle:         idle,
+		queue:        newTaskQueue(cfg.MaxChunkLen, cfg.MaxBuffered),
+		workerFree:   make(chan struct{}, 1),
+		drained:      make(chan struct{}),
+		pending:      newPendingTracker(),
+		logger:       cfg.Logger,
+		errorHandler: cfg.ErrorHandler,
+		panicHandler: cfg.PanicHandler,
+		hooks:        cfg.Hooks,
+	}
+	if p.logger == nil {
+		p.logger = log.Default()
 	}
 
 	// 队列接受任务的同一临界区里先增加 pending，保证计数先于任务对
@@ -108,7 +148,7 @@ func New(cfg Config) (*Pool, error) {
 	// 不能只等 worker。
 	p.wg.Add(1)
 	go p.dispatcher()
-	return p, nil
+	return p
 }
 
 // normalizeConfig 集中处理 Config 的默认值与合法性校验。
@@ -163,7 +203,7 @@ func (p *Pool) dispatcher() {
 		// 避免为了一个不会执行的任务消耗一个 worker。
 		// 丢弃同样是一次终态，必须走统一记账入口，否则 pending 会泄漏。
 		if err := abortErr(t); err != nil {
-			p.finishTask(outcomeForAbort(err))
+			p.finishTask(t, outcomeForAbort(err))
 			continue
 		}
 		p.dispatchTask(t)
@@ -177,20 +217,33 @@ func (p *Pool) dispatcher() {
 //   - 新建 worker 时，任务作为 firstTask 传入，不能再额外发送一次。
 //
 // 否则 worker 会在 <-wk.tasks 上永久阻塞，Close 的最后一棒也会失效。
+//
+// 达到容量上限时，等待 worker 的这段时间也必须能被任务自己的取消/deadline
+// 打断（T5）：被取消或超期的任务不会执行，如果它还占着 dispatcher 等一个
+// worker，队列里后续任务的派发就会被一起拖住。
 func (p *Pool) dispatchTask(t task) {
+	// deadline timer 只在真正进入“等 worker”分支时才创建：能被立即派发
+	// 的任务不该为一次成功的派发付出 timer 分配。整个等待期间最多一个
+	// timer；deadline 是绝对时间，不需要 Reset。
+	var deadlineTimer *time.Timer
+	var deadlineC <-chan time.Time
+	defer func() {
+		if deadlineTimer != nil {
+			deadlineTimer.Stop()
+		}
+	}()
+
 	for {
 		// 在等待 worker 期间任务可能已经取消/超期，此时直接丢弃，
 		// 不占用 worker（队列长度已在 pop 时减掉）。这条路径和
 		// dispatcher() 里的丢弃共用 outcomeForAbort + finishTask。
 		if err := abortErr(t); err != nil {
-			p.finishTask(outcomeForAbort(err))
+			p.finishTask(t, outcomeForAbort(err))
 			return
 		}
 
 		p.mu.Lock()
-		if len(p.idle) > 0 {
-			wk := p.idle[0]
-			p.idle = p.idle[1:]
+		if wk := p.popIdleLocked(); wk != nil {
 			p.mu.Unlock()
 			wk.tasks <- t // 一旦 pop，就一定要发
 			return
@@ -202,9 +255,35 @@ func (p *Pool) dispatchTask(t task) {
 		}
 		p.mu.Unlock()
 
-		// 没有空闲 worker 且达到容量上限：等 pushBack 或 worker 退出。
-		// worker 退出时 decRunning 也会发信号，避免容量槽释放后丢失唤醒。
-		<-p.workerFree
+		if deadlineTimer == nil && !t.deadline.IsZero() {
+			deadlineTimer = time.NewTimer(time.Until(t.deadline))
+			deadlineC = deadlineTimer.C
+		}
+
+		// 没有空闲 worker 且达到容量上限：等以下任一事件：
+		//   - worker 归还（pushBack）或容量槽释放（decRunning）；
+		//   - 任务 ctx 被取消（或 ctx 自身到期）；
+		//   - SubmitBefore 的 deadline 到期。
+		//
+		// workerFree 只是“可能变了”的提示，可能已过期（被其他等待者消费），
+		// 因此醒来后必须回到循环顶部，在锁内重新检查真实条件。
+		// 取消/超期分支直接走统一终态入口，不再认领 worker，dispatcher 随后
+		// 继续 pop 队列里的下一个任务。
+		select {
+		case <-p.workerFree:
+			// 不在这里下结论：提示可能已过期，回到循环顶部在 p.mu 内复查。
+		case <-taskDone(t.ctx):
+			// ctx 取消（或 ctx 自身到期）：不再认领 worker。
+			// 终态统一由 abortErr 判定，避免 ctx 与 deadline 同时成立时
+			// 依赖 select 的随机选择；与 runTask 入口的检查顺序一致。
+			p.finishTask(t, outcomeForAbort(abortErr(t)))
+			return
+		case <-deadlineC:
+			// SubmitBefore 的“开始执行”期限已过：同样走统一终态入口。
+			// 若此时 ctx 也已取消，abortErr 仍会给出 ctx 的终态。
+			p.finishTask(t, outcomeForAbort(abortErr(t)))
+			return
+		}
 	}
 }
 
@@ -213,6 +292,7 @@ func (p *Pool) dispatchTask(t task) {
 func (p *Pool) makeWorker(firstTask task) {
 	wk := &worker{tasks: make(chan task, 1)}
 	p.running++
+	p.created++
 	p.wg.Add(1)
 
 	go func(wk *worker, p *Pool) {
@@ -230,7 +310,7 @@ func (p *Pool) makeWorker(firstTask task) {
 		for {
 			// runTask 只负责产生结果；finishTask 负责恰好一次扣账。
 			// 即使 observeOutcome 里的日志/回调出错，扣账也已经完成。
-			p.finishTask(p.runTask(t))
+			p.finishTask(t, p.runTask(t))
 			p.pushBack(wk)
 
 			// 上一轮执行期间 timer 可能已经触发（尤其是慢任务），
@@ -264,7 +344,7 @@ func (p *Pool) makeWorker(firstTask task) {
 					// 被认领的 worker 一定会在 dispatcher 退出前收到任务：
 					// dispatcher 先完成 send，最后才 close(drained)。
 					t = <-wk.tasks
-					p.finishTask(p.runTask(t))
+					p.finishTask(t, p.runTask(t))
 					return
 				}
 			}
@@ -287,28 +367,48 @@ func resetTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
-// pushBack 把执行完任务的 worker 放回 idle。
+// pushBack 把执行完任务的 worker 放回 idle 栈。
 func (p *Pool) pushBack(wk *worker) {
 	p.mu.Lock()
-	p.idle = append(p.idle, wk)
+	p.pushIdleLocked(wk)
 	p.mu.Unlock()
 
 	// 先改状态，再发信号；否则等待者可能看到旧状态又睡回去。
 	p.signalWorkerFree()
 }
 
-// removeIdle 从 idle 中移除 worker；返回 false 表示它已被 dispatcher 认领。
+// idle 容器的三个操作都要求调用方持有 p.mu；容器本身不加锁。
+//
+// 不变量（由 idleContainer 实现共同保证）：
+//  1. 每个“存活且空闲”的 worker 在容器中恰好出现一次；
+//  2. Pop/Remove 之后容器不得再持有该 worker 的引用（实现负责清空槽位），
+//     否则会延长已退出/已认领 worker 及其 tasks channel 的生命周期；
+//  3. 容器不负责 idle timeout：worker 自己的 timer 到点后调用 removeIdle；
+//     容器不知道 idle 起始时间，也不关闭 worker。
+//
+// 默认实现是 FIFO 双向链表（fifoIdle，T12）：先空闲的 worker 先复用、也先超时，
+// Add/Pop/Remove 都是 O(1)，批量超时严格 O(n)；stackIdle 是 T8 的 LIFO 对照实现。
+func (p *Pool) pushIdleLocked(wk *worker) {
+	p.idle.Add(wk)
+}
+
+// popIdleLocked 取走下一个可复用的 worker；容器空时返回 nil。
+func (p *Pool) popIdleLocked() *worker {
+	return p.idle.Pop()
+}
+
+// removeIdleLocked 从容器移除指定 worker（worker 自身超时或池排空时使用）；
+// 返回 false 表示它已被 dispatcher 认领。
+func (p *Pool) removeIdleLocked(wk *worker) bool {
+	return p.idle.Remove(wk)
+}
+
+// removeIdle 从 idle 容器移除 worker；返回 false 表示它已被 dispatcher 认领。
 // 不要持 p.mu 调用。
 func (p *Pool) removeIdle(wk *worker) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i, w := range p.idle {
-		if w == wk {
-			p.idle = append(p.idle[:i], p.idle[i+1:]...)
-			return true
-		}
-	}
-	return false
+	return p.removeIdleLocked(wk)
 }
 
 // decRunning 在 worker 退出时减少计数。
@@ -385,18 +485,35 @@ func (p *Pool) enqueue(t task) error {
 	// 提前返回。pending 指标本身不含提交中任务（T0 第 1 条），被接受的
 	// 任务由 queue.pushLocked 在锁内调用 p.pending.add。
 	p.pending.beginSubmit()
-	defer p.pending.endSubmit()
 
-	return p.queue.push(t, t.ctx, t.deadline, p.cfg.Mode)
+	// Submitted 在参数校验之后、入队尝试之前触发：被拒绝的提交也会到达
+	// 这里，因此“尝试”与“接受”可以分开观测（Enqueued 只在成功时触发）。
+	p.hookSubmitted(t.ctx)
+
+	err := p.queue.push(t, t.ctx, t.deadline, p.cfg.Mode)
+	p.pending.endSubmit(err == nil)
+	if err != nil {
+		return err
+	}
+
+	// push 返回时 queue.mu 已释放；Enqueued 不允许在锁内触发用户回调。
+	// 代价是：任务可能已经被 dispatcher 取走甚至执行完，因此 Enqueued
+	// 与 Started/Completed 之间的顺序不保证（见 Hooks 文档）。
+	p.hookEnqueued(t.ctx)
+	return nil
 }
 
 // Close 停止接收新任务，并触发 dispatcher 排空缓冲区。
 //
-// Close 本身不阻塞；需要等所有已入队任务执行完，请调用 WaitPool。
+// Close 不等待已接受任务执行完；需要等它们完成，请调用 WaitPool。
+// Close 会同步执行 PoolClosed hook，因此阻塞的 hook 会延长 Close 的返回时间。
 // 典型顺序：Close() -> WaitPool()。
 func (p *Pool) Close() {
 	p.onceClose.Do(func() {
 		p.queue.close()
+		// PoolClosed 在队列关闭之后触发：回调里再 Submit 会稳定拿到
+		// ErrPoolClosed，而不是与关闭过程竞争。此时任务可能仍在执行。
+		p.hookPoolClosed()
 	})
 }
 
@@ -434,12 +551,16 @@ func (p *Pool) Running() int {
 	return p.running
 }
 
-// runTask 是任务执行的唯一入口：结果分类 + panic 隔离 + ctx/deadline 检查。
-// 它不负责记账；调用方拿到 taskOutcome 后必须交给 finishTask。
+// runTask 是任务执行的唯一入口：结果分类 + panic 隔离 + ctx/deadline 检查
+// + Started hook。它不负责记账；调用方拿到 taskOutcome 后必须交给 finishTask。
+//
+// panic 的 goroutine 栈必须在 recover 点捕获：一旦 recover 完成、栈展开结束，
+// 之后（如 finishTask 里的 PanicHandler）再调用 debug.Stack() 就只能看到
+// 回调自身的栈，看不到 panic 发生位置。
 func (p *Pool) runTask(t task) (out taskOutcome) {
 	defer func() {
 		if r := recover(); r != nil {
-			out = taskOutcome{result: resultPanic, panicVal: r}
+			out = taskOutcome{result: resultPanic, panicVal: r, stack: debug.Stack()}
 		}
 	}()
 
@@ -447,14 +568,27 @@ func (p *Pool) runTask(t task) (out taskOutcome) {
 		return outcomeForAbort(err)
 	}
 
-	ctx := t.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := contextOrBackground(t.ctx)
+
+	// Started 只在任务确实会执行时触发：被跳过（取消/超期）的任务不应让
+	// 观察者误以为它开始过。hook 自身的 panic 由 safeCallback 隔离，
+	// 不会在这里被误判成任务 panic。
+	p.hookStarted(ctx)
+
 	if err := t.Fn(ctx); err != nil {
 		return taskOutcome{result: resultError, err: err}
 	}
 	return taskOutcome{result: resultCompleted}
+}
+
+// taskDone 返回任务 ctx 的 Done channel；ctx 为 nil 时返回 nil，
+// 让 select 的这一路永远不就绪（Submit 系列入口都会填非 nil ctx，
+// 这里只做防御）。
+func taskDone(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
 }
 
 // abortErr 检查任务是否已经取消或超过开始执行期限。

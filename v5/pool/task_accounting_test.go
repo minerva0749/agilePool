@@ -110,6 +110,7 @@ func TestPendingDrainsOnErrorAndPanic(t *testing.T) {
 }
 
 // SubmitBefore 已超期、最终被 dispatcher 跳过的任务也必须恰好在跳过时扣账。
+// T5 之后，dispatcher 等 worker 期间就会响应 deadline，不再等 worker 释放。
 func TestPendingDrainsOnDeadlineSkipped(t *testing.T) {
 	p := newTestPool(t, Config{
 		Capacity:    1,
@@ -138,13 +139,11 @@ func TestPendingDrainsOnDeadlineSkipped(t *testing.T) {
 		t.Fatalf("SubmitBefore: %v", err)
 	}
 
-	// 让 deadline 真正过去；这不是用 sleep 代替状态同步，而是把
-	// “期限已过”这个时间条件显式等待出来。
-	deadlinePassed := time.Now().Add(60 * time.Millisecond)
-	waitUntil(t, 2*time.Second, func() bool { return time.Now().After(deadlinePassed) })
-
-	if got := pendingOf(p); got != 2 {
-		t.Fatalf("pending = %d (blocker + expired task), want 2", got)
+	// T5 起：dispatcher 等 worker 时也会响应 deadline，任务到期后立即进入
+	// 终态，不必等 worker 释放；pending 从 2 降到 1（只剩 blocker）。
+	waitUntil(t, 2*time.Second, func() bool { return pendingOf(p) == 1 })
+	if got := expiredRan.Load(); got != 0 {
+		t.Fatalf("expired task executed %d times before the worker was released, want 0", got)
 	}
 
 	close(release)
@@ -158,7 +157,8 @@ func TestPendingDrainsOnDeadlineSkipped(t *testing.T) {
 }
 
 // dispatcher 已经 pop 并持有一个任务、正在等 worker 时任务被取消：
-// 取消后释放 worker，dispatcher 必须走统一终态入口，pending 归零。
+// T5 起取消会立刻打断等待并走统一终态入口，pending 先减少；释放 worker
+// 后全部归零。
 func TestPendingDrainsOnCanceledHeldTask(t *testing.T) {
 	p := newTestPool(t, Config{
 		Capacity:    1,
@@ -195,6 +195,10 @@ func TestPendingDrainsOnCanceledHeldTask(t *testing.T) {
 	}
 
 	cancel()
+	// T5 起：取消会立刻打断 dispatcher 的等待，pending 先降到 1（只剩
+	// blocker），不依赖 worker 释放。
+	waitUntil(t, 2*time.Second, func() bool { return pendingOf(p) == 1 })
+
 	close(release)
 	waitPendingZero(t, p, 2*time.Second)
 
@@ -457,7 +461,7 @@ func TestRunTaskClassifiesOutcomes(t *testing.T) {
 	tests := []struct {
 		name      string
 		task      task
-		want      taskResult
+		want      TaskResult
 		wantErr   error
 		wantPanic bool
 	}{
@@ -540,7 +544,7 @@ func TestPendingTrackerWait(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	tr.done()
+	tr.done(resultCompleted)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):

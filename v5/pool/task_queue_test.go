@@ -282,3 +282,85 @@ func TestTaskQueueCanceledBeforePush(t *testing.T) {
 		t.Fatalf("size = %d, want 0", got)
 	}
 }
+
+// TestTaskQueueRecyclesChunks 固定 T9 的块复用行为：
+// 消费完的块进入 recycled 缓存，后续入队优先复用它；块内不残留 task。
+func TestTaskQueueRecyclesChunks(t *testing.T) {
+	q := newTaskQueue(2, -1)
+	defer q.close()
+
+	for i := 0; i < 4; i++ {
+		mustPush(t, q, queueTask(i))
+	}
+
+	q.mu.Lock()
+	first := q.head
+	q.mu.Unlock()
+
+	// 消费完第一个块：它必须被回收，而不是留给 GC。
+	for i := 0; i < 2; i++ {
+		if got := queueTaskID(mustPop(t, q)); got != i {
+			t.Fatalf("pop = %d, want %d", got, i)
+		}
+	}
+
+	q.mu.Lock()
+	if len(q.recycled) != 1 || q.recycled[0] != first {
+		got := len(q.recycled)
+		q.mu.Unlock()
+		t.Fatalf("recycled chunks = %d, want the first chunk", got)
+	}
+	for i, tk := range first.tasks {
+		if tk.Fn != nil || tk.ctx != nil || !tk.deadline.IsZero() {
+			q.mu.Unlock()
+			t.Fatalf("recycled chunk slot %d still references a task", i)
+		}
+	}
+	q.mu.Unlock()
+
+	// 再写两个任务：第一个填满当前块，第二个必须从 recycled 取回 first。
+	mustPush(t, q, queueTask(4))
+	mustPush(t, q, queueTask(5))
+
+	q.mu.Lock()
+	reused := q.tail
+	n := len(q.recycled)
+	q.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("recycled chunks = %d after reuse, want 0", n)
+	}
+	if reused != first {
+		t.Fatal("tail chunk was not reused from the recycled cache")
+	}
+
+	for i := 2; i < 6; i++ {
+		if got := queueTaskID(mustPop(t, q)); got != i {
+			t.Fatalf("pop = %d, want %d", got, i)
+		}
+	}
+}
+
+// TestTaskQueueRecycleCap 固定复用缓存的上限：超过 maxRecycledSlots
+// 的块不再保留，避免无界队列排空后长期占用大量内存。
+func TestTaskQueueRecycleCap(t *testing.T) {
+	const chunkLen = 4096 // 一个块就占满 maxRecycledSlots
+	q := newTaskQueue(chunkLen, -1)
+	defer q.close()
+
+	// 三个块：前两个消费完都可回收，但第二个会让槽位总数超过上限，
+	// 因此最终只应保留第一个；第三个仍作为 head/tail 留在队列里。
+	const total = 3 * chunkLen
+	for i := 0; i < total; i++ {
+		mustPush(t, q, task{})
+	}
+	for i := 0; i < total; i++ {
+		mustPop(t, q)
+	}
+
+	q.mu.Lock()
+	n := len(q.recycled)
+	q.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("recycled chunks = %d, want 1 (later chunks exceed the slot cap)", n)
+	}
+}

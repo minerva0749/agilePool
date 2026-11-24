@@ -1,6 +1,6 @@
 # agilePool — Go 协程池练习
 
-用纯 Go 标准库从零实现一个协程池。当前仓库只保留 **v5**：在 v4 的 context/超时语义之上，加入分块链表缓冲队列、背压和 BLOCK / NONBLOCK 提交模式。
+用纯 Go 标准库从零实现一个协程池。当前仓库只保留 **v5**：在 v4 的 context/超时语义之上，加入分块链表缓冲队列、背压和 BLOCK / NONBLOCK 提交模式，并补上可观测性回调、运行指标和可插拔的 idle 容器。
 
 ## v5 能力
 
@@ -16,6 +16,9 @@
 - **安全关闭**：`Close` 停止接收新任务，dispatcher 排空缓冲区后退出；`WaitPool` 等 dispatcher 和所有 worker 结束。
 - **panic 隔离**：单个任务 panic 只记日志，不会带走 worker。
 - **参数校验**：`fn == nil` 返回 `ErrNilTask`；配置默认值与校验集中在 `normalizeConfig`。
+- **可观测性**：`Logger` / `ErrorHandler` / `PanicHandler` 与生命周期 `Hooks`（Submitted、Enqueued、Started、Completed、Skipped）都在 `New` 时固定；回调自身的 panic 会被隔离，不会污染 worker 或提交方。
+- **运行指标**：`Pending` / `Queued` / `Idle` / `Busy` / `Running` / `Capacity` 的瞬时快照，以及 `Submitted` / `Rejected` / `Completed` / `Dropped` / `Panicked` / `WorkerCreateCount` 的累计计数。
+- **可插拔 idle 容器**：包内 `idleContainer` 接口，默认 LIFO 栈（复用最近归还的 worker），另提供 FIFO 实现作为对照；不新增公开 API。
 
 完整的状态机、提交错误优先级、并发不变量和阶段验收记录见
 [v5/实现方案与接口.md](v5/实现方案与接口.md)。
@@ -71,6 +74,10 @@ func main() {
 | `MaxChunkLen` | 每个 chunk 的容量 | `<= 0` 时使用默认值 `64` |
 | `MaxBuffered` | 缓冲任务总数上限 | `0` 时默认一个 chunk；`-1` 不设限；`< -1` 报错 |
 | `Mode` | 缓冲满时的提交行为 | 默认 `BLOCK`；非法值 `New` 返回错误 |
+| `Logger` | 池诊断输出（panic 默认报告等） | `nil` 时用 `log.Default()` |
+| `ErrorHandler` | 接收任务返回的非 nil error | `nil` 时静默丢弃 |
+| `PanicHandler` | 接收被隔离的任务 panic | `nil` 时经 `Logger` 输出默认报告 |
+| `Hooks` | 任务/池生命周期回调 | 零值表示不监听 |
 
 ### 错误
 
@@ -83,12 +90,62 @@ func main() {
 `ErrPoolClosed` → `ctx.Err()` → `DeadlineExceeded` → `ErrPoolFull`。
 `Close` 之后即使任务 ctx 已取消，也稳定返回 `ErrPoolClosed`，便于 producer 判断停止。
 
+### 运行指标
+
+```go
+p.Pending()    // 已接受（入队/已派发）且尚未到终态的任务数；不含正在 Submit 的
+p.Queued()     // 仍在缓冲队列里、还没被 dispatcher pop 的任务数（Queued <= Pending）
+p.Running()    // 正在执行 TaskFunc 的 worker 数
+p.Idle()       // idle 容器中的 worker 数
+p.Busy()       // 已被 dispatcher 认领或正在执行的 worker 数
+p.Capacity()   // 配置的 worker 上限
+
+p.Submitted()  // 参数合法的提交次数（含被拒绝的）
+p.Rejected()   // 被拒绝的提交次数
+p.Completed()  // 到达终态的任务数
+p.Dropped()    // 因 ctx 取消/超期被跳过的任务数
+p.Panicked()   // panic 被隔离的任务数
+p.WorkerCreateCount() // 累计创建的 worker 数（单调递增）
+```
+
+每个方法都是一次独立的瞬时快照，不保证跨方法来自同一时刻；`Busy` 是唯一在内部对同一次
+`p.mu` 快照计算 `running - len(idle)` 的方法。`Close` + `WaitPool` 之后，`Pending` /
+`Queued` / `Running` / `Idle` / `Busy` 回到 0，累计计数与 `Capacity` 不回退。
+
+### 可观测性
+
+```go
+p, _ := pool.New(pool.Config{
+    Capacity: 64,
+    Logger:   log.Default(),
+    ErrorHandler: func(ctx context.Context, err error) {
+        // 任务返回的非 nil error，在 worker goroutine 上同步调用
+    },
+    PanicHandler: func(ctx context.Context, recovered any, stack []byte) {
+        // 任务 panic 已被隔离，这里决定如何上报
+    },
+    Hooks: pool.Hooks{
+        Submitted: func(ctx context.Context) {},
+        Enqueued:  func(ctx context.Context) {},
+        Started:   func(ctx context.Context) {},
+        Completed: func(ctx context.Context, out pool.TaskOutcome) {},
+        Skipped:   func(ctx context.Context, out pool.TaskOutcome) {},
+    },
+})
+```
+
+- `TaskOutcome.Result` 取 `TaskCompleted` / `TaskFailed` / `TaskPanicked` / `TaskCanceled` /
+  `TaskDeadlineSkipped`，与五种终态一一对应。
+- `Completed` 与 `Skipped` 互斥：被取消或超期跳过的任务只触发 `Skipped`。
+- 所有回调都在 `New` 时固定，运行期不可替换，因此读取路径无需加锁。
+- 不要在池内部已持锁的路径上调用这些回调（包内实现已遵守）；也不要在任务函数里调 `WaitIdle`。
+
 ## 运行与测试
 
 ```bash
 cd v5
 go run .                 # 提交 1000 个任务，输出 done: 1000
-go test ./...            # 58 个测试：队列、背压、关闭排空、取消/超时、pending、WaitIdle、panic、压力
+go test ./...            # 94 个测试：队列、背压、关闭排空、取消/超时、pending、WaitIdle、panic、指标、hook、idle 容器、压力
 go test -race ./...
 go test ./pool -run 'TestTaskQueue|TestWaitIdle' -v
 go test ./pool -bench . -benchmem -run '^$'
@@ -102,17 +159,13 @@ v5/
 ├─ main.go
 ├─ 实现方案与接口.md
 └─ pool/
-   ├─ pool_interface.go
-   ├─ task_queue.go
-   ├─ task_state.go
-   ├─ pool_test.go
-   ├─ task_queue_test.go
-   ├─ pool_api_test.go
-   ├─ pool_regression_test.go
-   ├─ task_accounting_test.go
-   ├─ waitidle_test.go
-   ├─ benchmark_test.go
-   └─ benchmark_endtoend_test.go
+   ├─ pool_interface.go      # Config/New/Pool、提交与派发、worker 生命周期
+   ├─ task_queue.go          # 分块链表 FIFO 缓冲队列与背压
+   ├─ task_state.go          # 五种终态、pendingTracker 与累计计数
+   ├─ idle_container.go      # idleContainer 接口 + LIFO/FIFO 实现
+   ├─ metrics.go             # 运行指标读取 API
+   ├─ observability.go       # Logger / ErrorHandler / PanicHandler / Hooks
+   └─ *_test.go              # 单元、回归、压测与 benchmark
 ```
 
 ## 设计要点
@@ -128,6 +181,8 @@ v5/
 - 所有终态（完成/error/panic/取消跳过/超期跳过）统一经过 `finishTask`，保证每个被接受的任务恰好扣一次 pending。
 - `pendingTracker` 分开记录 `pending`（已接受）与 `submitting`（提交中）；`WaitIdle` 等两者归零，但 `pending` 仍只统计已接受任务。
 - 需要等池退出时使用 `Close → WaitIdle → WaitPool`：`WaitIdle` 等任务终态，`WaitPool` 等 goroutine 收尾。
+- idle 容器只负责“空闲 worker 的存放顺序”，自身不加锁，所有方法都必须在持有 `p.mu` 期间调用；worker 的 idle 超时由各自的 timer 驱动并回调 `Remove`，容器不保存 idle 起始时间。
+- 指标读取不新增锁：`Pending`/累计计数复用 `pendingTracker.mu`，`Idle`/`Busy`/`WorkerCreateCount` 复用 `p.mu`，`Queued` 复用 `queue.mu`。
 
 ## License
 

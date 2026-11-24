@@ -487,7 +487,7 @@ func TestPendingTrackerWaitsForSubmitting(t *testing.T) {
 	expectWaitIdleBlocked(t, done, 20*time.Millisecond,
 		"wait returned while a Submit was still inflight")
 
-	tr.endSubmit()
+	tr.endSubmit(true)
 	expectWaitIdleDone(t, done, 2*time.Second,
 		"wait did not return after the inflight Submit ended")
 }
@@ -504,11 +504,11 @@ func TestPendingTrackerWaitsForBothCounts(t *testing.T) {
 		close(done)
 	}()
 
-	tr.endSubmit()
+	tr.endSubmit(true)
 	expectWaitIdleBlocked(t, done, 20*time.Millisecond,
 		"wait returned while an accepted task was still pending")
 
-	tr.done()
+	tr.done(resultCompleted)
 	expectWaitIdleDone(t, done, 2*time.Second,
 		"wait did not return after both counts reached zero")
 }

@@ -26,6 +26,11 @@ func newChunk(size int) *chunk {
 	return &chunk{tasks: make([]task, size)}
 }
 
+// maxRecycledSlots 限制每个队列的空闲块缓存最多保留多少个任务槽位。
+// 用槽位数而不是块数做上限，避免 MaxChunkLen 很大时缓存占用失控；
+// 超出上限的块直接交给 GC。
+const maxRecycledSlots = 4096
+
 // taskQueue 是 v5 的缓冲队列：固定大小 chunk 串成的 FIFO 链表。
 //
 // 不变量：
@@ -45,11 +50,25 @@ type taskQueue struct {
 	maxTaskNum int // 最大任务数；-1 表示不设限
 	chunkLen   int
 
+	// recycled 是已完全消费、等待复用的块（T9）。只在 mu 内访问：
+	// popLocked 把消费完的块放入，pushLocked 优先从这里取，取不到才分配。
+	// 这样“队列满 → 消费释放块 → 继续入队”的稳态不再每 chunkLen 个任务
+	// 分配一次 ~chunkLen*sizeof(task) 的数组，也省掉对应的清零与 GC。
+	recycled []*chunk
+
 	closed   bool
 	closedCh chan struct{} // Close 时关闭，唤醒所有等待者
 
 	notEmpty chan struct{} // 队列非空提示，容量 1，允许合并
 	notFull  chan struct{} // 队列有空位提示，容量 1
+
+	// pushers 是已被判定为“队列满”、正在 notFull 上等待的 BLOCK 提交者数量。
+	// 由 mu 保护。pop 只在 pushers > 0 时发送 notFull；否则一次非阻塞发送
+	// 只是白白碰一次容量为 1 的 channel，在高吞吐下会放大 pop 的成本。
+	//
+	// 登记点必须在“锁内判定为满”的同一临界区：如果先解锁再登记，pop 可能
+	// 在中间释放空位并看到 pushers == 0 而跳过信号，导致提交者永久睡眠。
+	pushers int
 
 	// onAccept 在 pushLocked 写入任务后、仍持有 q.mu 时调用。
 	// Pool 用它把“接受任务”和“pending +1”放进同一个临界区，
@@ -112,16 +131,20 @@ func (q *taskQueue) push(t task, ctx context.Context, deadline time.Time, mode B
 		ctx = context.Background()
 	}
 
-	var deadlineC <-chan time.Time
-	if !deadline.IsZero() {
-		timer := time.NewTimer(time.Until(deadline))
-		defer timer.Stop()
-		deadlineC = timer.C
-	}
+	// T9：deadline timer 延迟到真正需要阻塞等待时才创建。队列立即可写时
+	// （SubmitBefore 的常见路径）不再为一次成功的入队分配 time.Timer。
+	var (
+		timer     *time.Timer
+		deadlineC <-chan time.Time
+	)
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 
-	// woke 表示上一次循环消费了 notFull token。若醒来后发现任务已被
-	// 取消/超期（不是关闭），要把这个“空位提示”还回去，否则其他阻塞的
-	// 提交者可能永远等不到唤醒。
+	// woke 表示本次 select 消费了 notFull token。若随后因取消/超期返回，
+	// 要把这个“空位提示”转交给其他阻塞提交者，否则它会被吞掉。
 	woke := false
 	for {
 		// 在锁外读取 ctx.Err()：自定义 Context 的 Err 方法属于用户代码，
@@ -138,36 +161,54 @@ func (q *taskQueue) push(t task, ctx context.Context, deadline time.Time, mode B
 		if ctxErr != nil {
 			q.mu.Unlock()
 			if woke {
-				q.signalNotFull()
+				q.forwardNotFull()
 			}
 			return ctxErr
 		}
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			q.mu.Unlock()
 			if woke {
-				q.signalNotFull()
+				q.forwardNotFull()
 			}
 			return context.DeadlineExceeded
 		}
 		if q.maxTaskNum < 0 || q.taskNum < q.maxTaskNum {
+			wasEmpty := q.taskNum == 0
 			q.pushLocked(t)
 			// 一次 pop 释放多个空位时，notFull 的容量 1 会合并通知。
-			// 如果入队后还有空位，把通知继续传给下一个等待者，
-			// 避免它明明有空间却一直睡到下一次 pop。
+			// 如果入队后还有空位，把通知继续传给下一个等待者。
 			moreSpace := q.maxTaskNum >= 0 && q.taskNum < q.maxTaskNum
+			waiters := q.pushers
 			q.mu.Unlock()
-			q.signalNotEmpty()
-			if moreSpace {
+
+			// T9：只有“空 → 非空”才会让一个正在等待的 pop 错过任务；
+			// 队列原本非空时，pop 已经在处理或会在下一次循环里看到。
+			if wasEmpty {
+				q.signalNotEmpty()
+			}
+			// 只有仍存在阻塞提交者时，空位提示才有接收者。
+			if moreSpace && waiters > 0 {
 				q.signalNotFull()
 			}
 			return nil
 		}
-		q.mu.Unlock()
 
 		if mode == NONBLOCK {
+			q.mu.Unlock()
 			return ErrPoolFull
 		}
 
+		// 在“判定为满”的同一临界区登记等待者：pop 只有在锁内看到
+		// pushers > 0 才会发 notFull，因此无等待者时可以安全省略信号。
+		q.pushers++
+		q.mu.Unlock()
+
+		if timer == nil && !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			deadlineC = timer.C
+		}
+
+		woke = false
 		select {
 		case <-q.notFull:
 			woke = true
@@ -176,19 +217,34 @@ func (q *taskQueue) push(t task, ctx context.Context, deadline time.Time, mode B
 		case <-ctx.Done():
 		case <-deadlineC:
 		}
+
+		q.mu.Lock()
+		q.pushers--
+		q.mu.Unlock()
+	}
+}
+
+// forwardNotFull 把当前 goroutine 消费到的空位提示转交给其他阻塞提交者。
+// 只在锁外调用；没有其他等待者时不需要发送（token 只会变成陈旧提示）。
+func (q *taskQueue) forwardNotFull() {
+	q.mu.Lock()
+	waiters := q.pushers
+	q.mu.Unlock()
+	if waiters > 0 {
+		q.signalNotFull()
 	}
 }
 
 // pushLocked 在 q.mu 内追加任务。
-// 队列空时复用最后一个 chunk；tail 满时新建 chunk 并链接。
+// 队列空时复用最后一个 chunk；tail 满时新建（或从 recycled 复用）chunk 并链接。
 func (q *taskQueue) pushLocked(t task) {
 	if q.tail == nil {
-		c := newChunk(q.chunkLen)
+		c := q.getChunkLocked()
 		q.head = c
 		q.tail = c
 	}
 	if q.tail.count == q.chunkLen {
-		c := newChunk(q.chunkLen)
+		c := q.getChunkLocked()
 		q.tail.next = c
 		q.tail = c
 	}
@@ -202,6 +258,40 @@ func (q *taskQueue) pushLocked(t task) {
 	}
 }
 
+// getChunkLocked 优先复用已消费完的块；没有可复用的块时才分配。
+// 必须在 q.mu 持有期间调用。
+func (q *taskQueue) getChunkLocked() *chunk {
+	n := len(q.recycled) - 1
+	if n < 0 {
+		return newChunk(q.chunkLen)
+	}
+	c := q.recycled[n]
+	q.recycled[n] = nil
+	q.recycled = q.recycled[:n]
+	return c
+}
+
+// recycleChunkLocked 把已完全消费的块放入复用缓存。
+//
+// 只接受 count == 0 的块：popLocked 每弹出一个任务就把对应槽位置零，
+// 因此块内不会残留 task（及其 ctx/Fn 引用）。缓存上限按槽位数计算，
+// 防止无界队列排空后长期保留大量块。超出上限时直接交给 GC。
+//
+// 必须在 q.mu 持有期间调用。
+func (q *taskQueue) recycleChunkLocked(c *chunk) {
+	if c == nil || q.closed {
+		// 关闭后不会再有入队，复用缓存没有意义；直接交给 GC。
+		return
+	}
+	if (len(q.recycled)+1)*q.chunkLen > maxRecycledSlots {
+		return
+	}
+	c.next = nil
+	c.read = 0
+	c.count = 0
+	q.recycled = append(q.recycled, c)
+}
+
 // pop 取队头任务。
 //
 // 关闭后仍会把队列剩余任务取完；只有“已关闭且为空”才返回 false。
@@ -211,8 +301,13 @@ func (q *taskQueue) pop() (task, bool) {
 		q.mu.Lock()
 		if q.taskNum > 0 {
 			t := q.popLocked()
+			waiters := q.pushers
 			q.mu.Unlock()
-			q.signalNotFull()
+			// T9：没有阻塞提交者时，这次 pop 释放的空位无人等待，
+			// 不需要碰 notFull；有等待者时仍需逐个释放提示。
+			if waiters > 0 {
+				q.signalNotFull()
+			}
 			return t, true
 		}
 		if q.closed {
@@ -238,7 +333,8 @@ func (q *taskQueue) popLocked() task {
 		}
 		old := q.head
 		q.head = q.head.next
-		old.next = nil // 断开旧块，让 GC 回收
+		old.next = nil
+		q.recycleChunkLocked(old) // 已消费完的块进入复用缓存
 	}
 
 	idx := q.head.read
@@ -253,6 +349,7 @@ func (q *taskQueue) popLocked() task {
 		old := q.head
 		q.head = q.head.next
 		old.next = nil
+		q.recycleChunkLocked(old)
 	}
 	return t
 }
@@ -266,6 +363,8 @@ func (q *taskQueue) close() {
 		return
 	}
 	q.closed = true
+	// 关闭后不会再有入队：复用缓存已无意义，释放它对已消费块的引用。
+	q.recycled = nil
 	q.mu.Unlock()
 	close(q.closedCh)
 }
