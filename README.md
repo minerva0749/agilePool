@@ -1,6 +1,6 @@
 # agilePool — Go 协程池练习
 
-用纯 Go 标准库从零实现一个协程池。当前仓库只保留 **v5**：在 v4 的 context/超时语义之上，加入分块链表缓冲队列、背压和 BLOCK / NONBLOCK 提交模式，并补上可观测性回调、运行指标和可插拔的 idle 容器。
+用纯 Go 标准库从零实现一个协程池。当前仓库只保留 **v5**：在 v4 的 context/超时语义之上，加入分块链表缓冲队列、背压和 BLOCK / NONBLOCK 提交模式，并补上可观测性回调、运行指标、可插拔的 idle 容器、批量派发和失败重试。
 
 ## v5 能力
 
@@ -19,6 +19,8 @@
 - **可观测性**：`Logger` / `ErrorHandler` / `PanicHandler` 与生命周期 `Hooks`（Submitted、Enqueued、Started、Completed、Skipped）都在 `New` 时固定；回调自身的 panic 会被隔离，不会污染 worker 或提交方。
 - **运行指标**：`Pending` / `Queued` / `Idle` / `Busy` / `Running` / `Capacity` 的瞬时快照，以及 `Submitted` / `Rejected` / `Completed` / `Dropped` / `Panicked` / `WorkerCreateCount` 的累计计数。
 - **可插拔 idle 容器**：包内 `idleContainer` 接口，默认 LIFO 栈（复用最近归还的 worker），另提供 FIFO 实现作为对照；不新增公开 API。
+- **批量派发**：dispatcher 一次从队列取出至多 `defaultBatchSize = 16` 个任务交给同一个已 idle 的 worker 顺序执行，并按“队列长度 / idle worker 数”公平分摊，避免一个 worker 抢走全部 backlog；新建 worker 仍只接一个任务以保留初始并发。批量是包内实现细节，不新增公开配置。
+- **失败重试**：`TaskWithRetry(fn, RetryPolicy{RetryNum: 3})` 把任务包装成“失败后按指数退避重试”的 TaskFunc，退避上限与算法可配（`BackOffStrategy`）；只有返回非 nil error 才重试，panic 不重试，退避等待可被 `ctx` 取消打断。
 
 完整的状态机、提交错误优先级、并发不变量和阶段验收记录见
 [v5/实现方案与接口.md](v5/实现方案与接口.md)。
@@ -140,12 +142,30 @@ p, _ := pool.New(pool.Config{
 - 所有回调都在 `New` 时固定，运行期不可替换，因此读取路径无需加锁。
 - 不要在池内部已持锁的路径上调用这些回调（包内实现已遵守）；也不要在任务函数里调 `WaitIdle`。
 
+### 失败重试
+
+```go
+p.Submit(pool.TaskWithRetry(fn, pool.RetryPolicy{
+    RetryNum:   3,                      // 额外重试 3 次，共执行 4 次
+    MinBackOff: 100 * time.Millisecond, // 缺省 100ms
+    MaxBackOff: time.Second,            // 缺省 1s，第 k 次重试等 MinBackOff*2^(k-1) 并封顶
+    // BackOffStrategy: func(attempt int, min, max time.Duration) time.Duration {...},
+}))
+```
+
+- 只有 `fn` 返回非 nil error 才重试；panic 不重试，直接交给池的 recover，终态是 `TaskPanicked`。
+- 重试属于同一个逻辑任务：pending 只加一次、只扣一次，`Submitted` / `Enqueued` / `Started` /
+  `Completed` 各触发一次；`ErrorHandler` 只在所有尝试结束后收到最终 error。
+- 退避等待用 `timer + select ctx.Done()`，可被 `ctx` 取消或 `ctx` 自身 deadline 立刻打断。
+  `SubmitBefore` 的 deadline 仍只约束“开始执行”，一旦开始就不影响重试过程。
+- 退避发生在执行 `fn` 的 worker 上，一次重试任务在成功或耗尽前会一直占用一个 worker。
+
 ## 运行与测试
 
 ```bash
 cd v5
 go run .                 # 提交 1000 个任务，输出 done: 1000
-go test ./...            # 94 个测试：队列、背压、关闭排空、取消/超时、pending、WaitIdle、panic、指标、hook、idle 容器、压力
+go test ./...            # 119 个测试：队列、背压、关闭排空、取消/超时、pending、WaitIdle、panic、指标、hook、idle 容器、批量派发、重试、压力
 go test -race ./...
 go test ./pool -run 'TestTaskQueue|TestWaitIdle' -v
 go test ./pool -bench . -benchmem -run '^$'
@@ -165,6 +185,7 @@ v5/
    ├─ idle_container.go      # idleContainer 接口 + LIFO/FIFO 实现
    ├─ metrics.go             # 运行指标读取 API
    ├─ observability.go       # Logger / ErrorHandler / PanicHandler / Hooks
+   ├─ retry.go               # RetryPolicy 与 TaskWithRetry
    └─ *_test.go              # 单元、回归、压测与 benchmark
 ```
 
@@ -183,6 +204,8 @@ v5/
 - 需要等池退出时使用 `Close → WaitIdle → WaitPool`：`WaitIdle` 等任务终态，`WaitPool` 等 goroutine 收尾。
 - idle 容器只负责“空闲 worker 的存放顺序”，自身不加锁，所有方法都必须在持有 `p.mu` 期间调用；worker 的 idle 超时由各自的 timer 驱动并回调 `Remove`，容器不保存 idle 起始时间。
 - 指标读取不新增锁：`Pending`/累计计数复用 `pendingTracker.mu`，`Idle`/`Busy`/`WorkerCreateCount` 复用 `p.mu`，`Queued` 复用 `queue.mu`。
+- 批量派发不改变并发模型：dispatcher 仍是队列唯一消费者，它取出的 batch 交给同一个 worker **顺序**执行；记账仍按任务逐个 `finishTask`，所以 pending、五类终态和 hook 语义与单任务派发完全一致。
+- 组批时会顺手把已取消/超期的额外任务直接判终态，不交给 worker；batch 内每个任务在执行前仍会再检查一次，覆盖组批之后才发生的取消/超期。
 
 ## License
 

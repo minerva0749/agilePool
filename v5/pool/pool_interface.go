@@ -25,6 +25,10 @@ var (
 const (
 	defaultMaxChunkLen = 64
 	defaultIdleTimeout = time.Second
+
+	// defaultBatchSize 只限制交给已 idle worker 的单批任务数；新建 worker
+	// 仍只接收一个任务，保持初始并发。批量是包内实现细节，不新增公开配置。
+	defaultBatchSize = 16
 )
 
 // BlockMode 控制缓冲队列满时提交方的行为。
@@ -44,7 +48,8 @@ type task struct {
 }
 
 type worker struct {
-	tasks chan task
+	// tasks 每次交接一个 FIFO batch；batch 内由该 worker 顺序执行。
+	tasks chan []task
 
 	// 以下字段只被 fifoIdle 使用，作为 idle 双向链表的节点；只在持有 p.mu
 	// 且 worker 位于 idle 容器时有效。stackIdle 实现不使用它们（T12）。
@@ -60,6 +65,10 @@ type Pool struct {
 	idle    idleContainer // 空闲 worker 容器（默认 FIFO；T12 包内可插拔）
 	running int           // 当前存活 worker 数（锁内维护）
 	created int64         // 自 New 以来创建过的 worker 总数（锁内维护，只增不减）
+
+	// batchSize 只影响已 idle worker 的复用路径；1 表示关闭批量。
+	// 构造后只读，包内测试可以临时改为 1 做行为对照。
+	batchSize int
 
 	wg        sync.WaitGroup // WaitPool 等 dispatcher + 所有 worker
 	onceClose sync.Once
@@ -127,6 +136,7 @@ func newPool(cfg Config, idle idleContainer) *Pool {
 	p := &Pool{
 		cfg:          cfg,
 		idle:         idle,
+		batchSize:    defaultBatchSize,
 		queue:        newTaskQueue(cfg.MaxChunkLen, cfg.MaxBuffered),
 		workerFree:   make(chan struct{}, 1),
 		drained:      make(chan struct{}),
@@ -213,8 +223,8 @@ func (p *Pool) dispatcher() {
 // dispatchTask 把 t 交给一个 worker。
 //
 // 这是 v5 的关键交接点，必须守住不变量：
-//   - 从 idle 取走一个 worker 后，必须向它的 tasks 发送恰好一个任务；
-//   - 新建 worker 时，任务作为 firstTask 传入，不能再额外发送一次。
+//   - 从 idle 取走一个 worker 后，必须向它的 tasks 发送恰好一个非空 batch；
+//   - 新建 worker 时，单任务 batch 作为 firstBatch 传入，不能再额外发送一次。
 //
 // 否则 worker 会在 <-wk.tasks 上永久阻塞，Close 的最后一棒也会失效。
 //
@@ -245,11 +255,16 @@ func (p *Pool) dispatchTask(t task) {
 		p.mu.Lock()
 		if wk := p.popIdleLocked(); wk != nil {
 			p.mu.Unlock()
-			wk.tasks <- t // 一旦 pop，就一定要发
+			// 只对已经 idle 的 worker 批量：t 是队头，extras 紧随其后，
+			// 由同一个 worker 顺序执行，dispatcher 仍是队列唯一消费者。
+			batch := p.collectBatch(t, p.batchLimit())
+			wk.tasks <- batch // 一旦 pop，就一定要发
 			return
 		}
 		if p.running < p.cfg.Capacity {
-			p.makeWorker(t) // 新 worker 以 firstTask 启动，不再额外 send
+			// 新建 worker 只给一个任务，保留初始并发，不让整批阻塞任务
+			// 被压缩到少数 worker 上。
+			p.makeWorker([]task{t})
 			p.mu.Unlock()
 			return
 		}
@@ -287,10 +302,64 @@ func (p *Pool) dispatchTask(t task) {
 	}
 }
 
-// makeWorker 创建一个 worker，并让 firstTask 成为它的第一个任务。
+// batchLimit 计算本次可交接的任务数上限。
+//
+// 除了 batchSize 之外，还按“队列长度 / 当前 idle worker 数”做公平分摊：
+// 当多个 worker 空闲而 backlog 不大时，每个 worker 只拿一个任务，避免
+// 一个 worker 拿走全部 backlog、其他 idle worker 无任务可做。
+// 这里读取的是瞬时计数，只作为调度启发式，不属于公开语义。
+func (p *Pool) batchLimit() int {
+	if p.batchSize <= 1 {
+		return 1
+	}
+	p.mu.Lock()
+	idle := p.idle.Len()
+	p.mu.Unlock()
+	if idle < 1 {
+		idle = 1
+	}
+
+	q := p.queue.size()
+	if q < 1 {
+		return 1
+	}
+	share := q / idle
+	if share < 1 {
+		share = 1
+	}
+	if share > p.batchSize {
+		share = p.batchSize
+	}
+	return share
+}
+
+// collectBatch 把 first 与队列头部的至多 limit-1 个任务组成一个 batch。
+// 已取消/超期的额外任务在此直接进入终态，不交给 worker；其余任务在执行前
+// 仍由 runTask 再检查一次，覆盖组批之后发生的取消/超期。
+func (p *Pool) collectBatch(first task, limit int) []task {
+	if limit < 1 {
+		limit = 1
+	}
+	batch := make([]task, 0, limit)
+	batch = append(batch, first)
+	if limit == 1 {
+		return batch
+	}
+	for _, t := range p.queue.popUpTo(limit - 1) {
+		if err := abortErr(t); err != nil {
+			p.finishTask(t, outcomeForAbort(err))
+			continue
+		}
+		batch = append(batch, t)
+	}
+	return batch
+}
+
+// makeWorker 创建一个 worker，并让 firstBatch 成为它的第一批任务。
+// 当前调用方固定传入单任务 batch，以保留初始并发。
 // 必须在 p.mu 持有期间调用（只由 dispatcher 调用）。
-func (p *Pool) makeWorker(firstTask task) {
-	wk := &worker{tasks: make(chan task, 1)}
+func (p *Pool) makeWorker(firstBatch []task) {
+	wk := &worker{tasks: make(chan []task, 1)}
 	p.running++
 	p.created++
 	p.wg.Add(1)
@@ -306,11 +375,13 @@ func (p *Pool) makeWorker(firstTask task) {
 		timeout := time.NewTimer(p.cfg.IdleTimeout)
 		defer timeout.Stop()
 
-		t := firstTask
+		batch := firstBatch
 		for {
-			// runTask 只负责产生结果；finishTask 负责恰好一次扣账。
-			// 即使 observeOutcome 里的日志/回调出错，扣账也已经完成。
-			p.finishTask(t, p.runTask(t))
+			// 同一 batch 内的任务由这个 worker 顺序执行；记账仍按任务
+			// 逐个 finishTask，pending、五类终态与 hook 语义不变。
+			for _, t := range batch {
+				p.finishTask(t, p.runTask(t))
+			}
 			p.pushBack(wk)
 
 			// 上一轮执行期间 timer 可能已经触发（尤其是慢任务），
@@ -321,13 +392,13 @@ func (p *Pool) makeWorker(firstTask task) {
 			/*
 				timeout 不放进外层循环重建，是因为 select 选中 timeout 后
 				worker 可能恰好被 dispatcher 认领：此时 removeIdle 失败，
-				说明任务马上会从 tasks 发过来，必须回到 select 继续等，
+				说明 batch 马上会从 tasks 发过来，必须回到 select 继续等，
 				不能直接退出。
 			*/
 		inner:
 			for {
 				select {
-				case t = <-wk.tasks:
+				case batch = <-wk.tasks:
 					// 不在这里 Stop：外层 resetTimer 会统一 Stop/drain/Reset。
 					// 这样任务执行期间即使 timer 到期，也不会留下旧信号。
 					break inner
@@ -335,16 +406,18 @@ func (p *Pool) makeWorker(firstTask task) {
 					if p.removeIdle(wk) {
 						return
 					}
-					// 被 dispatcher 认领了；继续等它把任务发进来。
+					// 被 dispatcher 认领了；继续等它把 batch 发进来。
 				case <-p.drained:
 					timeout.Stop()
 					if p.removeIdle(wk) {
 						return
 					}
-					// 被认领的 worker 一定会在 dispatcher 退出前收到任务：
+					// 被认领的 worker 一定会在 dispatcher 退出前收到 batch：
 					// dispatcher 先完成 send，最后才 close(drained)。
-					t = <-wk.tasks
-					p.finishTask(t, p.runTask(t))
+					batch = <-wk.tasks
+					for _, t := range batch {
+						p.finishTask(t, p.runTask(t))
+					}
 					return
 				}
 			}

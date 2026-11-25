@@ -101,7 +101,7 @@ type TaskOutcome struct {
 //     Submitted 早于 Enqueued（同一提交者 goroutine）。Enqueued 与 Started
 //     之间不保证顺序：任务入队后可能立即被 dispatcher 取走并开始执行，而
 //     Enqueued 必须在 queue.mu 释放后才能安全触发。
-//   - 重试（T10，尚未实现）按逻辑任务处理：Submitted/Enqueued/Started/
+//   - 重试（T10）按逻辑任务处理：Submitted/Enqueued/Started/
 //     Completed/Skipped 仍各触发一次，重试尝试不会重复触发这些 hook。
 type Hooks struct {
 	// Submitted 在提交参数合法（fn != nil）之后、尝试入队之前触发。

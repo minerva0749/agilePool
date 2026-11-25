@@ -323,6 +323,30 @@ func (q *taskQueue) pop() (task, bool) {
 	}
 }
 
+// popUpTo 一次取出至多 max 个任务，不等待队列变为非空。
+// 只由 dispatcher 调用；返回顺序与逐次 pop 完全相同。批量释放空位后，
+// notFull 仍只是一个容量为 1 的提示，由等待者醒来后在锁内复查真实空间。
+func (q *taskQueue) popUpTo(max int) []task {
+	if max <= 0 {
+		return nil
+	}
+	q.mu.Lock()
+	n := q.taskNum
+	if n > max {
+		n = max
+	}
+	out := make([]task, 0, n)
+	for len(out) < max && q.taskNum > 0 {
+		out = append(out, q.popLocked())
+	}
+	waiters := q.pushers
+	q.mu.Unlock()
+	if len(out) > 0 && waiters > 0 {
+		q.signalNotFull()
+	}
+	return out
+}
+
 // popLocked 在 q.mu 内消费一个任务。
 func (q *taskQueue) popLocked() task {
 	// 正常情况下 head 有任务；若为空则说明前面的块已经消费完，
